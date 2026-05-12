@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NCME Auto Play Helper
 // @namespace    https://www.ncme.org.cn/
-// @version      0.2.0
+// @version      0.3.0
 // @description  自动静音播放视频，并在当前页面可见时尝试进入下一节。
 // @match        https://www.ncme.org.cn/*
 // @run-at       document-idle
@@ -28,11 +28,25 @@
   let lastWindowOpenAt = 0;
   let lastWindowOpenUrl = '';
   let lastActivePlayerHeartbeatAt = 0;
+  let examHooksInstalled = false;
+  let examShieldInstalled = false;
+  let examAutoStarted = false;
+  let examSubmitInProgress = false;
+  let examCompletedAt = 0;
+  let examSessionKey = '';
+  let examReportHandledKey = '';
   let traceHooksInstalled = false;
   let traceEnabled = false;
   const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const triedPendingUnits = new Set();
   const traceLog = [];
+  const examRuntime = {
+    apiLog: [],
+    context: {},
+    lastPaperData: null,
+    lastSubmitPayload: null,
+    lastSubmitResponse: null,
+  };
 
   const STORAGE = {
     listUrl: 'ncme.auto.listUrl',
@@ -42,6 +56,10 @@
     courseSnapshot: 'ncme.auto.courseSnapshot',
     listPlayLock: 'ncme.auto.listPlayLock',
     activePlayer: 'ncme.auto.activePlayer',
+    examPayloads: 'ncme.auto.examPayloads',
+    examPlan: 'ncme.auto.examPlan',
+    expectedExam: 'ncme.auto.expectedExam',
+    examParamMap: 'ncme.auto.examParamMap',
   };
 
   const CFG = {
@@ -51,6 +69,8 @@
     listPlayQuietAfterClickMs: 30 * 1000,
     activePlayerStaleMs: 20 * 1000,
     activePlayerHeartbeatMs: 5000,
+    examAutoStartDelayMs: 1500,
+    examReportReturnDelayMs: 2500,
     debug: true,
     autoExpandUnits: true,
     courseButtonText: /立即播放|继续学习|开始学习|去学习|去播放/,
@@ -69,6 +89,32 @@
       messageType: 'markdown',
       timeoutMs: 15000,
       progressIntervalMs: 5 * 60 * 1000,
+    },
+    exam: {
+      enabled: true,
+      autoSubmit: true,
+      autoSelectBySheet: true,
+      answerSheets: {
+        1: 'ABCCB',
+        2: 'CBBCC',
+        3: 'BCBBA',
+        4: 'BCCBB',
+        5: 'BDCBC',
+        6: 'DCBDC',
+        7: 'CBCBB',
+        8: 'ACCBC',
+        9: 'CBBBB',
+        10: 'BBBCB',
+      },
+      topicIdToPaperNo: {
+        '76474': 1,
+        '76473': 2,
+      },
+      paperIdToPaperNo: {
+        '28502224': 1,
+        '28502225': 2,
+      },
+      paperIdSequenceBase: 28502223,
     },
   };
 
@@ -111,9 +157,23 @@
 
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
+  const compact = (s) => norm(s).replace(/\s+/g, '');
+
+  const getExamActionText = (el) => norm(el?.value || el?.innerText || el?.textContent || '');
+
+  const getExamActionCompactText = (el) => compact(el?.value || el?.innerText || el?.textContent || '');
+
   const now = () => Date.now();
 
   const hashText = (text) => encodeURIComponent(norm(text)).slice(0, 120) || 'empty';
+
+  const escapeCss = (value) => {
+    const text = String(value || '');
+    if (PAGE_WINDOW.CSS?.escape) {
+      return PAGE_WINDOW.CSS.escape(text);
+    }
+    return text.replace(/["\\]/g, '\\$&');
+  };
 
   const getBodyLines = () =>
     (document.body?.innerText || '')
@@ -161,6 +221,16 @@
     if (!raw) return fallback;
     try {
       return JSON.parse(raw);
+    } catch (_) {
+      return fallback;
+    }
+  };
+
+  const safeJsonParse = (value, fallback = null) => {
+    if (value == null || value === '') return fallback;
+    if (typeof value === 'object') return value;
+    try {
+      return JSON.parse(String(value));
     } catch (_) {
       return fallback;
     }
@@ -262,6 +332,94 @@
   };
 
   const getCourseSnapshot = () => readJsonStorage(STORAGE.courseSnapshot, null);
+
+  const getExamPlan = () => readJsonStorage(STORAGE.examPlan, null);
+
+  const getExamParamMap = () =>
+    readJsonStorage(STORAGE.examParamMap, {
+      byTopicId: {},
+      byPaperId: {},
+      items: [],
+    }) || { byTopicId: {}, byPaperId: {}, items: [] };
+
+  const setExamParamMap = (value) => {
+    const next = value || {};
+    next.byTopicId = next.byTopicId || {};
+    next.byPaperId = next.byPaperId || {};
+    next.items = Array.isArray(next.items) ? next.items : [];
+    setStorage(STORAGE.examParamMap, JSON.stringify(next));
+    return next;
+  };
+
+  const derivePaperNoFromPaperId = (paperId) => {
+    const numeric = Number(String(paperId || '').trim());
+    const base = Number(CFG.exam.paperIdSequenceBase || 0);
+    if (!Number.isFinite(numeric) || !Number.isFinite(base) || base <= 0) return 0;
+    const paperNo = numeric - base;
+    return CFG.exam.answerSheets[paperNo] ? paperNo : 0;
+  };
+
+  const rememberExamParamMapping = (context = {}, paperNo = 0, source = '') => {
+    const resolvedPaperNo = Number(paperNo || 0);
+    if (!resolvedPaperNo || !CFG.exam.answerSheets[resolvedPaperNo]) return false;
+
+    const topicId = String(context.topicId || '').trim();
+    const paperId = String(context.paperId || '').trim();
+    if (!topicId && !paperId) return false;
+
+    const map = getExamParamMap();
+    if (topicId) map.byTopicId[topicId] = resolvedPaperNo;
+    if (paperId) map.byPaperId[paperId] = resolvedPaperNo;
+
+    const key = `${topicId || '-'}|${paperId || '-'}`;
+    const existing = map.items.find((item) => item.key === key);
+    const item = {
+      key,
+      topicId,
+      paperId,
+      paperNo: resolvedPaperNo,
+      source: source || 'runtime',
+      updatedAt: now(),
+    };
+    if (existing) {
+      Object.assign(existing, item);
+    } else {
+      map.items.push(item);
+    }
+    while (map.items.length > 80) map.items.shift();
+    setExamParamMap(map);
+    return true;
+  };
+
+  const setExamPlan = (plan) => {
+    try {
+      localStorage.setItem(STORAGE.examPlan, JSON.stringify(plan));
+    } catch (_) {
+      // Ignore storage failures.
+    }
+  };
+
+  const getExpectedExam = () => {
+    const data = readJsonStorage(STORAGE.expectedExam, null);
+    if (!data?.updatedAt) return data;
+    if (now() - Number(data.updatedAt) > 30 * 60 * 1000) {
+      removeStorage(STORAGE.expectedExam);
+      return null;
+    }
+    return data;
+  };
+
+  const setExpectedExam = (paperNo, meta = {}) => {
+    if (!paperNo) return false;
+    setStorage(STORAGE.expectedExam, JSON.stringify({
+      paperNo: Number(paperNo) || 0,
+      updatedAt: now(),
+      ...meta,
+    }));
+    return true;
+  };
+
+  const clearExpectedExam = () => removeStorage(STORAGE.expectedExam);
 
   const setCourseSnapshot = (snapshot) => {
     try {
@@ -456,6 +614,250 @@
       removeStorage(STORAGE.activePlayer);
       log('active player clear:', reason);
     }
+  };
+
+  const pushExamApiLog = (item) => {
+    examRuntime.apiLog.push({
+      time: new Date().toISOString(),
+      ...item,
+    });
+    while (examRuntime.apiLog.length > 80) examRuntime.apiLog.shift();
+  };
+
+  const absorbExamUrlContext = (rawUrl) => {
+    const urlText = String(rawUrl || '').trim();
+    if (!urlText) return;
+
+    try {
+      const parsed = new URL(urlText, location.origin);
+      const params = parsed.searchParams;
+      for (const key of ['paperId', 'periodId', 'sourceType', 'topicId', 'batchId', 'examinationCode']) {
+        const value = params.get(key);
+        if (value) {
+          examRuntime.context[key] = value;
+        }
+      }
+      const inferredPaperNo =
+        derivePaperNoFromPaperId(examRuntime.context.paperId) ||
+        Number(getExpectedExam()?.paperNo || 0);
+      rememberExamParamMapping(examRuntime.context, inferredPaperNo, `url:${parsed.pathname}`);
+    } catch (_) {
+      // Ignore invalid URL parsing.
+    }
+  };
+
+  const absorbExamContext = (value) => {
+    const data = safeJsonParse(value, value);
+    if (!data || typeof data !== 'object') return;
+
+    const keys = [
+      'examinationCode',
+      'periodId',
+      'sourceType',
+      'topicId',
+      'batchId',
+      'evaluationType',
+      'practiceMode',
+      'useTime',
+      'userToken',
+      'userIdentification',
+    ];
+
+    for (const key of keys) {
+      if (data[key] !== undefined && data[key] !== null && data[key] !== '') {
+        examRuntime.context[key] = data[key];
+      }
+    }
+
+    if (Array.isArray(data.questions)) {
+      examRuntime.context.questions = data.questions;
+    }
+
+    if (data.data && typeof data.data === 'object') {
+      absorbExamContext(data.data);
+    }
+  };
+
+  const installExamApiHooks = () => {
+    if (examHooksInstalled) return true;
+    examHooksInstalled = true;
+
+    const isExamApiUrl = (url) => /\/resourceApi\/web\/exam\//.test(String(url || ''));
+
+    try {
+      const originalFetch = PAGE_WINDOW.fetch;
+      if (typeof originalFetch === 'function' && !originalFetch.__ncmeAutoExamWrapped) {
+        const wrappedFetch = function (...args) {
+          const url = String(args[0]?.url || args[0] || '');
+          const method = String(args[1]?.method || args[0]?.method || 'GET').toUpperCase();
+          const body = args[1]?.body || args[0]?.body || '';
+
+          if (!isExamApiUrl(url)) {
+            return originalFetch.apply(this, args);
+          }
+
+          absorbExamUrlContext(url);
+          const requestBody = safeJsonParse(body, body);
+          absorbExamContext(requestBody);
+          pushExamApiLog({
+            kind: 'fetch',
+            stage: 'request',
+            url,
+            method,
+            body: liteValue(requestBody, 0),
+          });
+
+          return originalFetch.apply(this, args).then(async (resp) => {
+            let text = '';
+            let json = null;
+            try {
+              text = await resp.clone().text();
+              json = safeJsonParse(text, null);
+            } catch (_) {
+              // Ignore clone/text failures.
+            }
+            absorbExamContext(json);
+            if (/submitPaper/.test(url)) {
+              examRuntime.lastSubmitPayload = requestBody;
+              examRuntime.lastSubmitResponse = json || text;
+            } else if (/paper/.test(url)) {
+              examRuntime.lastPaperData = json || text;
+            }
+            pushExamApiLog({
+              kind: 'fetch',
+              stage: 'response',
+              url: resp.url || url,
+              method,
+              status: resp.status,
+              body: liteValue(json || text, 0),
+            });
+            return resp;
+          });
+        };
+        wrappedFetch.__ncmeAutoExamWrapped = true;
+        PAGE_WINDOW.fetch = wrappedFetch;
+      }
+    } catch (err) {
+      log('exam fetch hook failed:', err);
+    }
+
+    try {
+      const XHR = PAGE_WINDOW.XMLHttpRequest;
+      if (XHR?.prototype && !XHR.prototype.__ncmeAutoExamWrapped) {
+        const originalOpen = XHR.prototype.open;
+        const originalSend = XHR.prototype.send;
+        XHR.prototype.open = function (method, url, ...rest) {
+          this.__ncmeExamTrace = {
+            method: String(method || 'GET').toUpperCase(),
+            url: String(url || ''),
+          };
+          return originalOpen.call(this, method, url, ...rest);
+        };
+        XHR.prototype.send = function (body) {
+          const meta = this.__ncmeExamTrace || {};
+          if (!isExamApiUrl(meta.url)) {
+            return originalSend.call(this, body);
+          }
+
+          absorbExamUrlContext(meta.url);
+          const requestBody = safeJsonParse(body, body);
+          absorbExamContext(requestBody);
+          pushExamApiLog({
+            kind: 'xhr',
+            stage: 'request',
+            url: meta.url,
+            method: meta.method,
+            body: liteValue(requestBody, 0),
+          });
+
+          this.addEventListener?.('loadend', () => {
+            let json = null;
+            const text = typeof this.responseText === 'string' ? this.responseText : '';
+            if (text) {
+              json = safeJsonParse(text, null);
+            }
+            absorbExamContext(json);
+            if (/submitPaper/.test(meta.url)) {
+              examRuntime.lastSubmitPayload = requestBody;
+              examRuntime.lastSubmitResponse = json || text;
+            } else if (/paper/.test(meta.url)) {
+              examRuntime.lastPaperData = json || text;
+            }
+            pushExamApiLog({
+              kind: 'xhr',
+              stage: 'response',
+              url: this.responseURL || meta.url,
+              method: meta.method,
+              status: this.status,
+              body: liteValue(json || text, 0),
+            });
+          });
+
+          return originalSend.call(this, body);
+        };
+        XHR.prototype.__ncmeAutoExamWrapped = true;
+      }
+    } catch (err) {
+      log('exam xhr hook failed:', err);
+    }
+
+    return true;
+  };
+
+  const installExamFocusShield = () => {
+    if (examShieldInstalled) return true;
+    examShieldInstalled = true;
+
+    const stop = (event) => {
+      try {
+        event.stopImmediatePropagation?.();
+        event.stopPropagation?.();
+      } catch (_) {
+        // Ignore event guard failures.
+      }
+    };
+
+    const defineGetter = (obj, key, getter) => {
+      try {
+        Object.defineProperty(obj, key, {
+          configurable: true,
+          enumerable: true,
+          get: getter,
+        });
+      } catch (_) {
+        // Ignore defineProperty failures.
+      }
+    };
+
+    for (const type of ['visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange', 'msvisibilitychange']) {
+      document.addEventListener(type, stop, true);
+      PAGE_WINDOW.addEventListener(type, stop, true);
+    }
+    for (const type of ['blur', 'pagehide', 'freeze']) {
+      PAGE_WINDOW.addEventListener(type, stop, true);
+    }
+
+    defineGetter(document, 'hidden', () => false);
+    defineGetter(document, 'visibilityState', () => 'visible');
+    defineGetter(document, 'webkitHidden', () => false);
+    defineGetter(document, 'webkitVisibilityState', () => 'visible');
+
+    try {
+      document.hasFocus = () => true;
+    } catch (_) {
+      // Ignore assignment failures.
+    }
+
+    try {
+      PAGE_WINDOW.onblur = null;
+      document.onvisibilitychange = null;
+      document.onwebkitvisibilitychange = null;
+    } catch (_) {
+      // Ignore handler cleanup failures.
+    }
+
+    log('exam focus shield installed');
+    return true;
   };
 
   const buildNotifyMarkdown = (level, title, lines = []) => {
@@ -689,6 +1091,115 @@
       )
       .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
 
+  const isExamActionText = (text) => /^(?:\u53bb\u505a\u9898|\u53bb\u7b54\u9898|\u53bb\u8003\u8bd5|\u5f00\u59cb\u8003\u8bd5|\u5f00\u59cb\u7b54\u9898|\u7ee7\u7eed\u8003\u8bd5|\u7ee7\u7eed\u7b54\u9898|\u7acb\u5373\u7b54\u9898|\u7acb\u5373\u8003\u8bd5)$/.test(compact(text || ''));
+
+  const inferExamProgress = (text) => {
+    const value = norm(text || '');
+    if (/\u5df2\u901a\u8fc7/.test(value)) return '\u5df2\u901a\u8fc7';
+    if (/\u672a\u901a\u8fc7/.test(value)) return '\u672a\u901a\u8fc7';
+    if (/\u5b66\u4e60\u4e2d/.test(value)) return '\u5b66\u4e60\u4e2d';
+    if (/\u672a\u5b66\u4e60/.test(value)) return '\u672a\u5b66\u4e60';
+    if (/\u5df2\u5b8c\u6210/.test(value)) return '\u5df2\u5b8c\u6210';
+    return inferStudyStatus(value);
+  };
+
+  const extractExamTitleFromText = (text) => {
+    const lines = String(text || '')
+      .split('\n')
+      .map((line) => norm(line))
+      .filter(Boolean);
+
+    return lines.find((line) =>
+      /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(line) &&
+      !/(?:\u4efb\u52a1\u70b9|\u5b8c\u6210\u6807\u51c6|\u8003\u8bd5\u533a\u95f4|\u7acb\u5373\u64ad\u653e|\u53bb\u505a\u9898|\u5df2\u901a\u8fc7|\u672a\u901a\u8fc7|\u5df2\u5b8c\u6210)/.test(line)
+    ) || '';
+  };
+
+  const getCourseListExamEntries = () => {
+    if (!isStudyCoursePage()) return [];
+
+    return Array.from(document.querySelectorAll('.courseStudyInfoDetail'))
+      .map((detailRow) => {
+        const rowText = norm(detailRow.textContent || '');
+        const actionCandidates = Array.from(
+          detailRow.querySelectorAll('.playbtn,button,a,[role="button"],.el-button,span,div')
+        );
+        const button = actionCandidates.find((candidate) =>
+          isVisible(candidate) &&
+          !isDisabled(candidate) &&
+          isExamActionText(candidate.textContent || candidate.value || '')
+        ) || null;
+
+        return {
+          button,
+          detailRow,
+          rowText,
+          title: extractExamTitleFromText(rowText) || extractLessonTitleFromText(rowText) || rowText.split(' ').slice(0, 6).join(' '),
+          status: inferExamProgress(rowText),
+        };
+      })
+      .filter((entry) =>
+        entry.button &&
+        /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(entry.rowText)
+      )
+      .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
+  };
+
+  const getPendingExamEntry = () =>
+    getCourseListExamEntries().find((entry) => !/^(?:\u5df2\u901a\u8fc7|\u5df2\u5b8c\u6210)$/.test(entry.status)) || null;
+
+  const isPendingExamEntry = (entry) =>
+    !!entry && !/^(?:\u5df2\u901a\u8fc7|\u5df2\u5b8c\u6210)$/.test(String(entry.status || ''));
+
+  const getExamEntriesForUnitItem = (unitItem) => {
+    if (!unitItem) return [];
+
+    return Array.from(unitItem.querySelectorAll('.courseStudyInfoDetail'))
+      .map((detailRow) => {
+        const rowText = norm(detailRow.textContent || '');
+        const actionCandidates = Array.from(
+          detailRow.querySelectorAll('.playbtn,button,a,[role="button"],.el-button,span,div')
+        );
+        const button = actionCandidates.find((candidate) =>
+          isVisible(candidate) &&
+          !isDisabled(candidate) &&
+          isExamActionText(candidate.textContent || candidate.value || '')
+        ) || null;
+
+        return {
+          detailRow,
+          rowText,
+          button,
+          title: extractExamTitleFromText(rowText) || extractLessonTitleFromText(rowText) || rowText.split(' ').slice(0, 6).join(' '),
+          status: inferExamProgress(rowText),
+        };
+      })
+      .filter((entry) =>
+        entry.button &&
+        isVisible(entry.button) &&
+        !isDisabled(entry.button) &&
+        /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(entry.rowText)
+      )
+      .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
+  };
+
+  const getExamEntriesForUnitScope = (unitItem, nextRowTop = Number.POSITIVE_INFINITY) => {
+    if (!unitItem) return [];
+
+    const directEntries = getExamEntriesForUnitItem(unitItem);
+    if (directEntries.length > 0) {
+      return directEntries;
+    }
+
+    const rowTop = unitItem.getBoundingClientRect().top;
+    return getCourseListExamEntries()
+      .filter((entry) => {
+        const rect = entry.button.getBoundingClientRect();
+        return rect.top > rowTop + 10 && rect.top < nextRowTop - 10;
+      })
+      .sort((a, b) => a.button.getBoundingClientRect().top - b.button.getBoundingClientRect().top);
+  };
+
   const fireClick = (el) => {
     const doc = el?.ownerDocument || document;
     const view = doc.defaultView || window;
@@ -842,6 +1353,45 @@
       }
     }
     return docs;
+  };
+
+  const queryAllDeep = (selector) => {
+    const out = [];
+    const seen = new Set();
+
+    const add = (el) => {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      out.push(el);
+    };
+
+    const walkRoot = (root) => {
+      let nodes = [];
+      try {
+        nodes = Array.from(root.querySelectorAll(selector));
+      } catch (_) {
+        nodes = [];
+      }
+      nodes.forEach(add);
+
+      let all = [];
+      try {
+        all = Array.from(root.querySelectorAll('*'));
+      } catch (_) {
+        all = [];
+      }
+      for (const el of all) {
+        if (el.shadowRoot) {
+          walkRoot(el.shadowRoot);
+        }
+      }
+    };
+
+    for (const doc of allDocs()) {
+      walkRoot(doc);
+    }
+
+    return out;
   };
 
   const queryByText = (regex, selector = 'a,button,span,div,p') => {
@@ -1159,6 +1709,147 @@
     );
   };
 
+  const getStudyItemTitle = (item) =>
+    norm(
+      item?.name ||
+      item?.title ||
+      item?.materialName ||
+      item?.topicName ||
+      item?.paperName ||
+      item?.contentName ||
+      item?.resourceName ||
+      ''
+    );
+
+  const getStudyItemKeyCandidates = (item) =>
+    uniq(
+      [
+        item?.topicId,
+        item?.id,
+        item?.materialId,
+        item?.contentId,
+        item?.resourceId,
+        item?.paperId,
+        item?.questionId,
+      ]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    );
+
+  const isExamLikeStudyItem = (item) => {
+    const text = norm([
+      getStudyItemTitle(item),
+      item?.typeDesc || '',
+      item?.moduleTypeDesc || '',
+      item?.contentTypeDesc || '',
+      item?.resourceTypeDesc || '',
+      item?.categoryName || '',
+    ].join(' '));
+
+    return (
+      !!text &&
+      (
+        CFG.skipAutoPlayItemText.test(text) ||
+        /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(text)
+      )
+    );
+  };
+
+  const getExamPlanEntryByTitle = (title, plan = getExamPlan()) => {
+    const text = norm(title || '');
+    if (!text || !plan?.units?.length) return null;
+    const hash = hashText(text);
+
+    for (const unit of plan.units) {
+      for (const item of unit.items || []) {
+        if (item.kind !== 'exam') continue;
+        if (item.titleHash === hash) return item;
+        if (item.title && (item.title.includes(text) || text.includes(item.title))) {
+          return item;
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const collectExamPlanFromCourseStudy = () => {
+    if (!isStudyCoursePage()) return null;
+
+    const courseList = getCourseStudyList();
+    if (!Array.isArray(courseList) || courseList.length === 0) {
+      return null;
+    }
+
+    let paperNo = 0;
+    const units = [];
+    const byTopicId = {};
+    const byTitleHash = {};
+
+    for (const unit of courseList) {
+      if (!unit || typeof unit !== 'object') continue;
+      const unitTitle = getStudyItemTitle(unit);
+      const materialSources = uniq([
+        ...(Array.isArray(unit.materialList) ? unit.materialList : []),
+        ...(Array.isArray(unit.topicList) ? unit.topicList : []),
+        ...(Array.isArray(unit.contentList) ? unit.contentList : []),
+      ]);
+
+      const items = [];
+      for (const material of materialSources) {
+        if (!material || typeof material !== 'object') continue;
+        const title = getStudyItemTitle(material);
+        if (!title) continue;
+
+        const isExam = isExamLikeStudyItem(material);
+        const ids = getStudyItemKeyCandidates(material);
+        const item = {
+          kind: isExam ? 'exam' : 'video',
+          title,
+          titleHash: hashText(title),
+          ids,
+          status: inferExamProgress(norm([
+            title,
+            material?.studyStatusDesc || '',
+            material?.statusDesc || '',
+            material?.progressDesc || '',
+            String(material?.studyStatus ?? ''),
+          ].join(' '))),
+        };
+
+        if (isExam) {
+          paperNo += 1;
+          item.paperNo = paperNo;
+          ids.forEach((id) => {
+            byTopicId[id] = paperNo;
+          });
+          byTitleHash[item.titleHash] = paperNo;
+        }
+
+        items.push(item);
+      }
+
+      units.push({
+        title: unitTitle,
+        studyStatus: Number(unit.studyStatus ?? -1),
+        isShow: !!unit.isShow,
+        items,
+      });
+    }
+
+    const plan = {
+      courseTitle: extractCourseTitleFromPage(),
+      updatedAt: now(),
+      examCount: paperNo,
+      byTopicId,
+      byTitleHash,
+      units,
+    };
+
+    setExamPlan(plan);
+    return plan;
+  };
+
   const getPendingCourseItemByVue = () =>
     getCourseStudyList().find((item) =>
       item &&
@@ -1187,8 +1878,9 @@
     vm.$nextTick?.(() => {
       log('vue expand nextTick:', item.id, item.name, 'isShow=', item.isShow);
       const pending = getPendingPlayEntries(false);
+      const pendingExam = getPendingExamEntry();
       log('visible pending after vue expand:', pending.length);
-      if (pending.length > 0) {
+      if (pending.length > 0 || pendingExam) {
         tryStartCourseFromList();
       }
     });
@@ -1310,33 +2002,49 @@
       }
 
       const entries = getPlayEntriesForUnitScope(unitItem, nextRowTop);
+      const examEntries = getExamEntriesForUnitScope(unitItem, nextRowTop);
       log(
         'unit play entries:',
         entries.length,
         entries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
       );
 
-      const visiblePendingEntries = getPendingPlayEntries(false);
-      const entry =
-        entries.find((item) => isPendingLessonText(item.rowText)) ||
-        visiblePendingEntries[0] ||
-        null;
+      log(
+        'unit exam entries:',
+        examEntries.length,
+        examEntries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
+      );
+
+      const videoEntry = entries.find((item) => isPendingLessonText(item.rowText)) || null;
+      const examEntry = examEntries.find((item) => isPendingExamEntry(item)) || null;
+      const entry = videoEntry || examEntry || null;
 
       if (!entry && attempt >= 1) {
         log(
-          'no visible pending play entry, stop probing:',
+          'no scoped pending unit action, stop probing:',
           entries.map((item) => `${item.status}:${item.title}`).join(' | ').slice(0, 240),
-          'globalPending=',
-          visiblePendingEntries.length
+          'exam=',
+          examEntries.map((item) => `${item.status}:${item.title}`).join(' | ').slice(0, 240)
         );
         finish('no-pending-entry');
         return;
       }
       if (entry) {
-        log('click unit course button:', entry.title, entry.status, norm(entry.button.textContent));
+        const isExamEntry = !!examEntry && entry === examEntry && !videoEntry;
+        log(isExamEntry ? 'click unit exam button:' : 'click unit course button:', entry.title, entry.status, norm(entry.button.textContent));
+        if (isExamEntry) {
+          const plannedExam = getExamPlanEntryByTitle(entry.title) || getExamPlanEntryByTitle(entry.rowText);
+          if (plannedExam?.paperNo) {
+            setExpectedExam(plannedExam.paperNo, {
+              title: plannedExam.title || entry.title || '',
+              source: 'unit-schedule',
+            });
+            log('expected exam paper set:', plannedExam.paperNo, plannedExam.title || entry.title || '');
+          }
+        }
         if (clickElOnce(entry.button)) {
           const parsed = parseLessonTitle(entry.title);
-          beginNavigation(`list-play:${entry.status}`, entry.title);
+          beginNavigation(isExamEntry ? `list-exam:${entry.status}` : `list-play:${entry.status}`, entry.title);
           void sendNotify('LIST', '展开后进入视频', [
             snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
             parsed.unitLabel ? `单元: ${parsed.unitLabel}` : '',
@@ -1551,7 +2259,9 @@
     clearActivePlayer(`return-list:${reason}`);
     beginNavigation(`list:${reason}`);
     setStorage(STORAGE.returningToList, '1');
-    notifyUnitBoundary(reason);
+    if (!/^exam-report$/.test(String(reason || ''))) {
+      notifyUnitBoundary(reason);
+    }
 
     if (listUrl) {
       location.href = listUrl;
@@ -1614,6 +2324,10 @@
       return false;
     }
 
+    if (isExamReportPage()) {
+      return false;
+    }
+
     const path = String(location.pathname || '').toLowerCase();
     if (/(exam|test|paper|question|answer)/.test(path)) {
       return true;
@@ -1628,6 +2342,1646 @@
       return true;
     }
 
+    return false;
+  };
+
+  const getExamPayloadConfigs = () => readJsonStorage(STORAGE.examPayloads, {});
+
+  const setExamPayloadConfigs = (value) => {
+    setStorage(STORAGE.examPayloads, JSON.stringify(value || {}));
+    return true;
+  };
+
+  const getUserAuthInfo = () => {
+    const nuxt = PAGE_WINDOW.$nuxt;
+    const userInfo =
+      nuxt?.$store?.state?.userInfo ||
+      nuxt?.context?.store?.state?.userInfo ||
+      null;
+
+    const token = userInfo?.token || '';
+    const tokenHead = userInfo?.tokenHead || '';
+
+    return {
+      token,
+      tokenHead,
+      header: token ? `${tokenHead || ''}${token}`.trim() : '',
+    };
+  };
+
+  const getExamContext = () => {
+    const route = PAGE_WINDOW.$nuxt?.$route || null;
+    const query = route?.query || {};
+    return {
+      ...examRuntime.context,
+      periodId: examRuntime.context.periodId || query.periodId || '',
+      sourceType: examRuntime.context.sourceType || query.sourceType || query.projectType || '',
+      topicId: examRuntime.context.topicId || query.topicId || query.id || '',
+      paperId: examRuntime.context.paperId || query.paperId || '',
+      batchId: examRuntime.context.batchId || '',
+      route: route ? {
+        path: route.path,
+        fullPath: route.fullPath,
+        query,
+      } : null,
+    };
+  };
+
+  const selectExamPayloadConfig = () => {
+    const configs = getExamPayloadConfigs();
+    const context = getExamContext();
+    const keys = [
+      `topicId:${context.topicId}`,
+      String(context.topicId || ''),
+      `periodId:${context.periodId}:topicId:${context.topicId}`,
+      'default',
+    ].filter(Boolean);
+
+    for (const key of keys) {
+      if (configs[key]) {
+        return { key, config: configs[key] };
+      }
+    }
+
+    if (Array.isArray(configs.questions)) {
+      return { key: 'root', config: configs };
+    }
+
+    return { key: '', config: null };
+  };
+
+  const buildExamSubmitPayload = () => {
+    const { key, config } = selectExamPayloadConfig();
+    if (!config) return null;
+
+    const context = getExamContext();
+    const auth = getUserAuthInfo();
+    const basePayload = config.payload && typeof config.payload === 'object' ? { ...config.payload } : {};
+    const questions = Array.isArray(config.questions)
+      ? config.questions
+      : Array.isArray(basePayload.questions)
+        ? basePayload.questions
+        : [];
+
+    const payload = {
+      examinationCode: basePayload.examinationCode ?? config.examinationCode ?? context.examinationCode ?? '',
+      periodId: String(basePayload.periodId ?? config.periodId ?? context.periodId ?? ''),
+      sourceType: String(basePayload.sourceType ?? config.sourceType ?? context.sourceType ?? ''),
+      topicId: String(basePayload.topicId ?? config.topicId ?? context.topicId ?? ''),
+      batchId: basePayload.batchId ?? config.batchId ?? context.batchId ?? '',
+      userToken: basePayload.userToken ?? config.userToken ?? auth.token ?? '',
+      userIdentification: basePayload.userIdentification ?? config.userIdentification ?? '',
+      questions,
+      evaluationType: basePayload.evaluationType ?? config.evaluationType ?? context.evaluationType ?? 1,
+      practiceMode: basePayload.practiceMode ?? config.practiceMode ?? context.practiceMode ?? 2,
+      useTime: basePayload.useTime ?? config.useTime ?? context.useTime ?? 5,
+      isForceSubmit: basePayload.isForceSubmit ?? config.isForceSubmit ?? 0,
+    };
+
+    if (!payload.questions || payload.questions.length === 0) {
+      return null;
+    }
+
+    return {
+      key,
+      payload,
+    };
+  };
+
+  const getExamPageTitle = () => {
+    const selectors = [
+      '.title-body',
+      '.paper-title',
+      '.exam-title',
+      '.questionTitle',
+      'h1',
+      'h2',
+      'h3',
+    ];
+
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        const text = norm(el.textContent || '');
+        if (text && /试卷|考试|测验|答题/.test(text)) {
+          return text;
+        }
+      }
+    }
+
+    return getBodyLines().find((line) => /试卷|考试|测验|答题/.test(line)) || '';
+  };
+
+  const extractExamPaperNumber = (text) => {
+    const value = norm(text || '');
+    if (!value) return 0;
+    const compactValue = value.replace(/[^\u4e00-\u9fa5A-Za-z0-9]+/g, '');
+
+    const patterns = [
+      /\u8bd5\u5377\s*([0-9]{1,2})/,
+      /\u8bfe\u7a0b\s*([0-9]{1,2})/,
+      /\u5355\u5143\s*([0-9]{1,2})/,
+      /\u7ae0\u8282\s*([0-9]{1,2})/,
+      /\u7b2c\s*([0-9]{1,2})\s*(?:\u5957|\u4efd)/,
+      /试卷\s*([0-9]{1,2})/,
+      /课程\s*([0-9]{1,2})/,
+      /单元\s*([0-9]{1,2})/,
+      /章节\s*([0-9]{1,2})/,
+      /第\s*([0-9]{1,2})\s*套/,
+      /第\s*([0-9]{1,2})\s*份/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = value.match(pattern);
+      if (match) {
+        return Number(match[1]) || 0;
+      }
+      const compactMatch = compactValue.match(pattern);
+      if (compactMatch) {
+        return Number(compactMatch[1]) || 0;
+      }
+    }
+
+    return 0;
+  };
+
+  const getMappedExamPaperNo = (context, title = '') => {
+    const topicId = String(context?.topicId || '').trim();
+    const paperId = String(context?.paperId || '').trim();
+    if (topicId && CFG.exam.topicIdToPaperNo?.[topicId]) {
+      return Number(CFG.exam.topicIdToPaperNo[topicId]) || 0;
+    }
+    if (paperId && CFG.exam.paperIdToPaperNo?.[paperId]) {
+      return Number(CFG.exam.paperIdToPaperNo[paperId]) || 0;
+    }
+
+    const runtimeMap = getExamParamMap();
+    if (topicId && runtimeMap.byTopicId?.[topicId]) {
+      return Number(runtimeMap.byTopicId[topicId]) || 0;
+    }
+    if (paperId && runtimeMap.byPaperId?.[paperId]) {
+      return Number(runtimeMap.byPaperId[paperId]) || 0;
+    }
+
+    const paperNoBySequence = derivePaperNoFromPaperId(paperId);
+    if (paperNoBySequence) {
+      return paperNoBySequence;
+    }
+
+    const plan = getExamPlan();
+    if (title) {
+      const planned = getExamPlanEntryByTitle(title, plan);
+      if (planned?.paperNo) {
+        return Number(planned.paperNo) || 0;
+      }
+    }
+
+    if (topicId && plan?.byTopicId?.[topicId]) {
+      return Number(plan.byTopicId[topicId]) || 0;
+    }
+
+    return 0;
+  };
+
+  const getExamAnswerSheet = () => {
+    const rawTitle = getExamPageTitle();
+    const bodyLines = getBodyLines();
+    const betterTitle =
+      bodyLines.find((line) =>
+        /(?:\u57fa\u7840\u7ec4\u5377|\u8bd5\u5377\s*\d+|[\u8bd5\u8003\u6d4b]\u5377|\u8bfe\u7a0b\u8003\u6838)/.test(line)
+      ) || '';
+    const title = betterTitle || rawTitle;
+    const context = getExamContext();
+    const plan = getExamPlan();
+    const expected = getExpectedExam();
+
+    const detectedPaperNo = extractExamPaperNumber(title);
+    const mappedPaperNo = getMappedExamPaperNo(context, title);
+    const planPaperNo =
+      Number(plan?.byTopicId?.[String(context.topicId || '')] || 0) ||
+      Number(plan?.byTitleHash?.[hashText(title)] || 0) ||
+      Number(getExamPlanEntryByTitle(title, plan)?.paperNo || 0);
+    const expectedPaperNo = Number(expected?.paperNo || 0);
+    const paperNo = detectedPaperNo || mappedPaperNo || planPaperNo || expectedPaperNo;
+    const sequence = CFG.exam.answerSheets[paperNo] || '';
+    rememberExamParamMapping(context, paperNo, 'sheet');
+    return {
+      title,
+      detectedPaperNo,
+      mappedPaperNo,
+      paperNo,
+      sequence,
+      answers: sequence ? sequence.split('') : [],
+    };
+  };
+
+  const formatScoreValue = (value) => {
+    if (value == null || value === '') return '';
+    const text = String(value).trim();
+    if (!text) return '';
+    const numeric = Number(text.replace(/[^\d.%-]/g, ''));
+    if (Number.isFinite(numeric)) {
+      return Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(2).replace(/\.?0+$/, '');
+    }
+    return text;
+  };
+
+  const formatPercentValue = (value) => {
+    if (value == null || value === '') return '';
+    const text = String(value).trim();
+    if (!text) return '';
+    if (/%$/.test(text)) return text;
+    const numeric = Number(text.replace(/[^\d.-]/g, ''));
+    if (!Number.isFinite(numeric)) return text;
+    const percent = numeric <= 1 ? numeric * 100 : numeric;
+    const rounded = Math.round(percent * 100) / 100;
+    return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '')}%`;
+  };
+
+  const findNestedScalarByKey = (root, regex, depth = 0, seen = new WeakSet()) => {
+    if (root == null || depth > 6) return undefined;
+    if (typeof root !== 'object') return undefined;
+    if (seen.has(root)) return undefined;
+    seen.add(root);
+
+    for (const [key, value] of Object.entries(root)) {
+      if (regex.test(String(key || '')) && (typeof value === 'string' || typeof value === 'number')) {
+        return value;
+      }
+    }
+
+    for (const value of Object.values(root)) {
+      if (value && typeof value === 'object') {
+        const nested = findNestedScalarByKey(value, regex, depth + 1, seen);
+        if (nested !== undefined) return nested;
+      }
+    }
+
+    return undefined;
+  };
+
+  const firstMatchValue = (text, patterns) => {
+    const value = String(text || '');
+    for (const pattern of patterns) {
+      const match = value.match(pattern);
+      if (match?.[1]) {
+        return match[1];
+      }
+    }
+    return '';
+  };
+
+  const buildExamSessionKey = () => {
+    const context = getExamContext();
+    const parts = [
+      context.periodId,
+      context.sourceType,
+      context.topicId,
+      context.paperId,
+    ]
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+
+    if (parts.length > 0) {
+      return parts.join('|');
+    }
+
+    const title = getExamPageTitle() || document.title || location.pathname;
+    return `path:${location.pathname}|title:${hashText(title)}`;
+  };
+
+  const syncExamSessionState = () => {
+    const nextKey = buildExamSessionKey();
+    if (!nextKey) return '';
+
+    if (examSessionKey && examSessionKey !== nextKey) {
+      log('exam session changed:', examSessionKey, '->', nextKey);
+      resetExamAutomationState('session-change');
+      examReportHandledKey = '';
+    }
+
+    examSessionKey = nextKey;
+    return examSessionKey;
+  };
+
+  const clearExamSessionState = (reason = 'clear') => {
+    if (examSessionKey || examReportHandledKey) {
+      log('exam session clear:', reason, examSessionKey || '(empty)');
+    }
+    examSessionKey = '';
+    examReportHandledKey = '';
+    clearExpectedExam();
+  };
+
+  const getExamReportSummary = () => {
+    const bodyText = norm(document.body?.innerText || '');
+    const response = safeJsonParse(examRuntime.lastSubmitResponse, examRuntime.lastSubmitResponse);
+    const context = getExamContext();
+    const sheet = getExamAnswerSheet();
+
+    const responseScore = findNestedScalarByKey(
+      response,
+      /(?:^|_)(?:score|mark|grade)(?:$|_)|[\u5f97\u5206\u5206\u6570\u6210\u7ee9]/i,
+    );
+    const responseAccuracy = findNestedScalarByKey(
+      response,
+      /(?:correct.*rate|accuracy|right.*rate|scoreRate|correctRate|accuracyRate)|[\u6b63\u786e\u7387\u7b54\u5bf9\u7387]/i,
+    );
+    const responseCorrectCount = findNestedScalarByKey(
+      response,
+      /(?:correct.*count|right.*count|correctNum|rightNum)|(?:\u6b63\u786e.*\u9898\u6570|\u7b54\u5bf9.*\u9898)/i,
+    );
+    const responseTotalCount = findNestedScalarByKey(
+      response,
+      /(?:total.*count|question.*count|allCount|totalNum)|(?:\u603b\u9898\u6570|\u603b\u5171.*\u9898)/i,
+    );
+
+    const textScore = firstMatchValue(bodyText, [
+      /\u5f97\u5206\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/,
+      /\u6210\u7ee9\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/,
+      /\u5206\u6570\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/,
+    ]);
+    const textAccuracy = firstMatchValue(bodyText, [
+      /\u6b63\u786e\u7387\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?%?)/,
+      /\u7b54\u5bf9\u7387\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?%?)/,
+    ]);
+    const textCorrectCount = firstMatchValue(bodyText, [
+      /\u7b54\u5bf9\s*([0-9]+)\s*\u9898/,
+      /\u505a\u5bf9\s*([0-9]+)\s*\u9898/,
+      /\u6b63\u786e\s*([0-9]+)\s*\u9898/,
+    ]);
+    const textTotalCount = firstMatchValue(bodyText, [
+      /\u5171\s*([0-9]+)\s*\u9898/,
+      /\u603b\u5171\s*([0-9]+)\s*\u9898/,
+      /\u603b\u9898\u6570\s*[:：]?\s*([0-9]+)/,
+    ]);
+
+    const score = formatScoreValue(responseScore ?? textScore);
+    let accuracy = formatPercentValue(responseAccuracy ?? textAccuracy);
+    const correctCount = formatScoreValue(responseCorrectCount ?? textCorrectCount);
+    const totalCount = formatScoreValue(responseTotalCount ?? textTotalCount);
+
+    if (!accuracy && correctCount && totalCount) {
+      const correctNum = Number(correctCount);
+      const totalNum = Number(totalCount);
+      if (Number.isFinite(correctNum) && Number.isFinite(totalNum) && totalNum > 0) {
+        accuracy = formatPercentValue((correctNum / totalNum) * 100);
+      }
+    }
+
+    const title = getExamPageTitle() || sheet.title || document.title || '';
+    const passed =
+      /\u5df2\u901a\u8fc7|\u901a\u8fc7|\u5408\u683c/.test(bodyText) &&
+      !/\u672a\u901a\u8fc7|\u4e0d\u5408\u683c/.test(bodyText);
+
+    return {
+      title,
+      paperNo: sheet.paperNo || 0,
+      topicId: String(context.topicId || ''),
+      periodId: String(context.periodId || ''),
+      score,
+      accuracy,
+      correctCount,
+      totalCount,
+      passed,
+      bodyText,
+    };
+  };
+
+  const isExamReportPage = () => {
+    const bodyText = norm(document.body?.innerText || '');
+    if (!bodyText) return false;
+
+    const path = String(location.pathname || '').toLowerCase();
+    const pathHint = /(report|result|analysis|score)/.test(path);
+    const hasReportHint = /(?:\u505a\u9898\u62a5\u544a|\u7b54\u9898\u62a5\u544a|\u8003\u8bd5\u7ed3\u679c|\u6210\u7ee9\u62a5\u544a|\u8003\u8bd5\u62a5\u544a)/.test(bodyText);
+    const hasScoreHint = /(?:\u5f97\u5206|\u6210\u7ee9|\u5206\u6570)/.test(bodyText);
+    const hasAccuracyHint = /(?:\u6b63\u786e\u7387|\u7b54\u5bf9\u7387|\u7b54\u5bf9\s*\d+\s*\u9898)/.test(bodyText);
+    const hasQuestionInputs = !!queryVisible('input[type="radio"],input[type="checkbox"],textarea');
+    const hasSubmitButton = findExamSubmitButtons().length > 0;
+
+    return !hasQuestionInputs && !hasSubmitButton && ((hasScoreHint && hasAccuracyHint) || hasReportHint || (pathHint && hasScoreHint));
+  };
+
+  const handleExamReportPage = async () => {
+    const sessionKey = syncExamSessionState();
+    const summary = getExamReportSummary();
+    if (!summary) return false;
+    if (!summary.score && !summary.accuracy && !summary.correctCount && !summary.totalCount) {
+      log('exam report summary not ready yet');
+      return false;
+    }
+
+    const reportKey = [
+      sessionKey || 'no-session',
+      summary.score || 'no-score',
+      summary.accuracy || 'no-accuracy',
+      summary.correctCount || 'no-correct',
+      summary.totalCount || 'no-total',
+    ].join('|');
+
+    if (examReportHandledKey === reportKey) {
+      return true;
+    }
+
+    examReportHandledKey = reportKey;
+    examAutoStarted = false;
+    examSubmitInProgress = false;
+    examCompletedAt = now();
+    clearExpectedExam();
+
+    const lines = [
+      summary.title ? `\u8bd5\u5377: ${summary.title}` : '',
+      summary.paperNo ? `paper: ${summary.paperNo}` : '',
+      summary.score ? `\u5f97\u5206: ${summary.score}` : '',
+      summary.accuracy ? `\u6b63\u786e\u7387: ${summary.accuracy}` : '',
+      summary.correctCount && summary.totalCount ? `\u7b54\u5bf9: ${summary.correctCount} / ${summary.totalCount}` : '',
+      summary.passed ? `\u7ed3\u679c: \u5df2\u901a\u8fc7` : '',
+    ].filter(Boolean);
+
+    void sendNotify('\u0045\u0058\u0041\u004d', '\u8003\u8bd5\u62a5\u544a', lines, {
+      intervalMs: 5000,
+      key: `exam-report:${hashText(reportKey)}`,
+    });
+
+    await sleep(CFG.examReportReturnDelayMs);
+    goToCourseList('exam-report');
+    return true;
+  };
+
+  const extractExamOptionLettersFromText = (text) => {
+    const value = norm(text || '');
+    if (!value) return [];
+
+    const out = [];
+    const seen = new Set();
+    const regex = /(?:^|[^A-Z])([A-F])(?:[\s).:：、]|$)/ig;
+    let match = regex.exec(value);
+    while (match) {
+      const letter = String(match[1] || '').toUpperCase();
+      if (letter && !seen.has(letter)) {
+        seen.add(letter);
+        out.push(letter);
+      }
+      match = regex.exec(value);
+    }
+
+    if (out.length === 0 && /^[A-F]$/i.test(value.charAt(0))) {
+      out.push(value.charAt(0).toUpperCase());
+    }
+    return out;
+  };
+
+  const getExamCurrentQuestionIndex = () => {
+    const activeSelectors = [
+      '.active',
+      '.is-active',
+      '.current',
+      '.on',
+      '.cur',
+      '.selected',
+      '.now',
+      '.doing',
+    ].join(',');
+
+    for (const doc of allDocs()) {
+      for (const el of doc.querySelectorAll(activeSelectors)) {
+        if (!isVisible(el)) continue;
+        const text = norm(el.textContent || '');
+        if (/^\d{1,2}$/.test(text)) {
+          return Number(text) || 0;
+        }
+        const questionMatch = text.match(/第\s*(\d{1,2})\s*题/);
+        if (questionMatch) {
+          return Number(questionMatch[1]) || 0;
+        }
+      }
+    }
+
+    for (const line of getBodyLines()) {
+      const matchers = [
+        line.match(/第\s*(\d{1,2})\s*题/),
+        line.match(/题号\s*[:：]?\s*(\d{1,2})/),
+        line.match(/\b(\d{1,2})\s*\/\s*(\d{1,2})\b/),
+      ];
+      for (const match of matchers) {
+        if (!match) continue;
+        const index = Number(match[1]) || 0;
+        if (index > 0 && index <= 99) {
+          return index;
+        }
+      }
+    }
+
+    const model = getExamQuestionModel();
+    if (model?.questions?.length) {
+      const unansweredIndex = model.questions.findIndex((question) => {
+        const answers = Array.isArray(question?.userAnswer) ? question.userAnswer.filter(Boolean) : [];
+        return answers.length === 0;
+      });
+      if (unansweredIndex >= 0) {
+        return unansweredIndex + 1;
+      }
+      return 1;
+    }
+
+    return 0;
+  };
+
+  const getExamQuestionSignature = () => {
+    const lines = getBodyLines()
+      .filter((line) => !/开始考试|继续考试|提交试卷|确认交卷|上一题|下一题|交卷|考试时间|剩余时间/.test(line))
+      .slice(0, 16);
+    return hashText(lines.join(' | '));
+  };
+
+  const getExamTextOptionClickTarget = (el, letter) => {
+    let cur = el;
+    let best = el;
+    for (let i = 0; cur && cur !== document.body && i < 6; i += 1) {
+      const text = norm(cur.textContent || '');
+      const letters = extractExamOptionLettersFromText(text);
+      if (letters.length > 1) break;
+      if (letters[0] === letter && text.length <= 260) {
+        best = cur;
+      }
+      cur = cur.parentElement;
+    }
+    return best;
+  };
+
+  const getExamRawOptionCandidates = () => {
+    const out = [];
+    const seen = new Set();
+
+    const pushCandidate = (candidate) => {
+      if (!candidate?.target || !candidate.letter) return;
+      if (!isVisible(candidate.target) || isDisabled(candidate.target)) return;
+      const rect = candidate.target.getBoundingClientRect();
+      const key = [
+        candidate.letter,
+        Math.round(rect.top),
+        Math.round(rect.left),
+        candidate.target.tagName,
+        candidate.target.className || '',
+      ].join(':');
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        ...candidate,
+        top: rect.top,
+        left: rect.left,
+        text: norm(candidate.target.textContent || candidate.text || ''),
+      });
+    };
+
+    for (const doc of allDocs()) {
+      for (const input of doc.querySelectorAll('input[type="radio"],input[type="checkbox"]')) {
+        if (!isExamInputUsable(input)) continue;
+        const letter = detectOptionLetter(input);
+        if (!letter) continue;
+        pushCandidate({
+          input,
+          letter,
+          target: getExamOptionClickTarget(input),
+          source: 'input',
+        });
+      }
+    }
+
+    const selectors = 'label,button,a,span,div,p,li';
+    for (const doc of allDocs()) {
+      for (const el of doc.querySelectorAll(selectors)) {
+        if (!isVisible(el) || isDisabled(el)) continue;
+
+        const text = norm(el.textContent || '');
+        if (!text || text.length > 120) continue;
+        if (/开始考试|继续考试|提交试卷|确认交卷|上一题|下一题|交卷/.test(text)) continue;
+
+        const letters = extractExamOptionLettersFromText(text);
+        if (letters.length !== 1) continue;
+
+        const hasChildOption = Array.from(el.children || []).some((child) =>
+          isVisible(child) && extractExamOptionLettersFromText(norm(child.textContent || '')).length > 0
+        );
+        if (hasChildOption) continue;
+
+        pushCandidate({
+          input: null,
+          letter: letters[0],
+          target: getExamTextOptionClickTarget(el, letters[0]),
+          source: 'text',
+          text,
+        });
+      }
+    }
+
+    return out.sort((a, b) => a.top - b.top || a.left - b.left);
+  };
+
+  const getExamOptionScope = (el) => {
+    if (!el) return null;
+
+    let cur = el;
+    let best = el.parentElement || el;
+    let bestScore = 0;
+
+    for (let i = 0; cur && cur !== document.body && i < 8; i += 1) {
+      const text = norm(cur.innerText || cur.textContent || '');
+      const score = extractExamOptionLettersFromText(text).length;
+      if (score >= bestScore) {
+        best = cur;
+        bestScore = score;
+      }
+      if (score >= 3) {
+        break;
+      }
+      cur = cur.parentElement;
+    }
+
+    return best;
+  };
+
+  const getExamCurrentQuestionOptions = () => {
+    const raw = getExamRawOptionCandidates();
+    if (raw.length === 0) {
+      return {
+        scope: null,
+        items: [],
+        letters: [],
+      };
+    }
+
+    const scopes = new Map();
+    for (const item of raw) {
+      const scope = getExamOptionScope(item.target) || item.target;
+      const rect = scope.getBoundingClientRect();
+      const key = `${scope.tagName}:${Math.round(rect.top)}:${Math.round(rect.left)}:${scope.className || ''}`;
+      if (!scopes.has(key)) {
+        scopes.set(key, {
+          scope,
+          top: rect.top,
+          left: rect.left,
+          items: [],
+          letterSet: new Set(),
+        });
+      }
+      const group = scopes.get(key);
+      if (group.letterSet.has(item.letter)) continue;
+      group.letterSet.add(item.letter);
+      group.items.push(item);
+    }
+
+    const ranked = Array.from(scopes.values())
+      .map((group) => ({
+        ...group,
+        letters: Array.from(group.letterSet).sort(),
+      }))
+      .sort((a, b) => {
+        if (b.letters.length !== a.letters.length) return b.letters.length - a.letters.length;
+        return a.top - b.top || a.left - b.left;
+      });
+
+    const best = ranked[0] || null;
+    if (!best) {
+      return {
+        scope: null,
+        items: [],
+        letters: [],
+      };
+    }
+
+    return {
+      scope: best.scope,
+      items: best.items.sort((a, b) => a.left - b.left || a.top - b.top),
+      letters: best.letters,
+    };
+  };
+
+  const isExamQuestionObject = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const hasQuestionMeta =
+      value.questionNum !== undefined ||
+      value.no !== undefined ||
+      value.code !== undefined ||
+      value.title !== undefined ||
+      value.optionalContent !== undefined;
+    const hasAnswerField =
+      value.userAnswer !== undefined ||
+      value.userDoQuestionStatus !== undefined ||
+      value.status !== undefined;
+    return hasQuestionMeta && hasAnswerField;
+  };
+
+  const collectExamQuestionModels = (value, path = 'root', depth = 0, seen = new WeakSet()) => {
+    if (!value || typeof value !== 'object') return [];
+    if (seen.has(value) || depth > 4) return [];
+    seen.add(value);
+
+    const models = [];
+    if (Array.isArray(value)) {
+      const questions = value.filter(isExamQuestionObject);
+      if (questions.length >= 3) {
+        models.push({
+          path,
+          questions: value,
+          questionCount: questions.length,
+        });
+      }
+
+      value.slice(0, 20).forEach((item, index) => {
+        models.push(...collectExamQuestionModels(item, `${path}[${index}]`, depth + 1, seen));
+      });
+      return models;
+    }
+
+    Object.keys(value).slice(0, 25).forEach((key) => {
+      try {
+        models.push(...collectExamQuestionModels(value[key], `${path}.${key}`, depth + 1, seen));
+      } catch (_) {
+        // Ignore getter errors.
+      }
+    });
+    return models;
+  };
+
+  const getExamVmCandidates = () => {
+    const seeds = uniq([
+      ...getExamRawOptionCandidates().map((item) => item.target),
+      queryVisible('.questionTitle'),
+      queryVisible('[class*="question"]'),
+      queryVisible('[class*="paper"]'),
+      document.body,
+    ].filter(Boolean));
+
+    const seenVm = new Set();
+    const candidates = [];
+
+    for (const seed of seeds) {
+      for (const vm of getVueVmChainForElement(seed)) {
+        if (!vm || seenVm.has(vm)) continue;
+        seenVm.add(vm);
+
+        const roots = [
+          { source: '$data', value: vm.$data || null },
+          { source: '$props', value: vm.$props || null },
+        ];
+
+        for (const root of roots) {
+          if (!root.value || typeof root.value !== 'object') continue;
+          const models = collectExamQuestionModels(root.value, root.source);
+          for (const model of models) {
+            candidates.push({
+              vm,
+              root: root.source,
+              path: model.path,
+              questions: model.questions,
+              questionCount: model.questionCount,
+            });
+          }
+        }
+      }
+    }
+
+    return candidates.sort((a, b) => b.questionCount - a.questionCount);
+  };
+
+  const getExamQuestionModel = () => {
+    const candidate = getExamVmCandidates()[0] || null;
+    if (!candidate) return null;
+    return {
+      vm: candidate.vm,
+      root: candidate.root,
+      path: candidate.path,
+      questions: candidate.questions,
+      summary: summarizeVue(candidate.vm),
+    };
+  };
+
+  const applyExamAnswersByModel = () => {
+    const sheet = getExamAnswerSheet();
+    const model = getExamQuestionModel();
+    if (!sheet.answers.length || !model?.questions?.length) return false;
+
+    const questions = model.questions;
+    const vm = model.vm;
+    let applied = 0;
+    const details = [];
+
+    for (let i = 0; i < Math.min(sheet.answers.length, questions.length); i += 1) {
+      const question = questions[i];
+      const answer = String(sheet.answers[i] || '').toUpperCase();
+      if (!question || !answer) continue;
+
+      const current = Array.isArray(question.userAnswer) ? question.userAnswer : [];
+      if (typeof vm?.$set === 'function') {
+        vm.$set(question, 'userAnswer', [answer]);
+      } else {
+        question.userAnswer = [answer];
+      }
+
+      if (Array.isArray(current) && current.__ob__ && Array.isArray(question.userAnswer)) {
+        current.splice(0, current.length, answer);
+        question.userAnswer = current;
+      }
+
+      if (question.userDoQuestionStatus !== undefined) {
+        if (typeof vm?.$set === 'function') {
+          vm.$set(question, 'userDoQuestionStatus', 1);
+        } else {
+          question.userDoQuestionStatus = 1;
+        }
+      }
+
+      applied += 1;
+      details.push(`Q${i + 1}:${answer}:${question.code || question.questionNum || question.no || ''}`);
+    }
+
+    vm?.$forceUpdate?.();
+    vm?.$nextTick?.(() => {
+      log('exam model nextTick applied:', model.path, details.join(' | '));
+    });
+    log('exam answers applied by vue model:', model.path, `${applied}/${Math.min(sheet.answers.length, questions.length)}`, details.join(' | '));
+    return applied > 0;
+  };
+
+  const navigateExamToSubmit = async (maxSteps = 8) => {
+    for (let i = 0; i < maxSteps; i += 1) {
+      if (findExamSubmitButtons().length > 0) {
+        return true;
+      }
+      const nextButton = findExamNextButton();
+      if (!nextButton) {
+        return false;
+      }
+      log('exam navigate to submit, click next:', norm(nextButton.textContent || ''));
+      clickElOnce(nextButton);
+      await sleep(600);
+    }
+    return findExamSubmitButtons().length > 0;
+  };
+
+  const findExamStartButton = () =>
+    queryByText(/开始考试|继续考试|进入考试|开始答题|继续答题/, 'button,a,span,div');
+
+  const findExamNextButton = () =>
+    queryByText(/下一题|下一页|下一步|继续答题|继续考试/, 'button,a,span,div');
+
+  const getExamInputVisibilityTarget = (input) =>
+    input.closest('label') ||
+    (input.id ? document.querySelector(`label[for="${escapeCss(input.id)}"]`) : null) ||
+    input.parentElement ||
+    input;
+
+  const isExamInputUsable = (input) => {
+    if (!input || input.disabled) return false;
+    const target = getExamInputVisibilityTarget(input);
+    return !!target && isVisible(target);
+  };
+
+  const getExamQuestionGroupKey = (input, index) => {
+    const name = String(input.name || input.getAttribute('name') || '').trim();
+    if (name) return `${input.type}:${name}`;
+
+    const container = input.closest('[class*="question"],[class*="topic"],li,.el-form-item,fieldset,table,tr');
+    if (container) {
+      return `container:${container.tagName}:${Math.round(container.getBoundingClientRect().top)}`;
+    }
+
+    return `fallback:${index}`;
+  };
+
+  const extractExamOptionLetterFromText = (text) => {
+    const value = norm(text || '');
+    if (!value) return '';
+
+    const match = value.match(/(?:^|[^A-Z])([A-F])(?:[\s).:：、]|$)/i);
+    if (match) return match[1].toUpperCase();
+    if (/^[A-F]$/i.test(value.charAt(0))) return value.charAt(0).toUpperCase();
+    return '';
+  };
+
+  const detectOptionLetter = (input) => {
+    const texts = uniq([
+      input.id ? document.querySelector(`label[for="${escapeCss(input.id)}"]`)?.textContent : '',
+      input.closest('label')?.textContent || '',
+      input.parentElement?.textContent || '',
+      input.parentElement?.parentElement?.textContent || '',
+    ].map((item) => norm(item || '')).filter(Boolean));
+
+    for (const text of texts) {
+      const match = text.match(/(?:^|[\s(（【\[])([A-F])(?:[、.．:：\s)）】\]-]|$)/i);
+      if (match) return match[1].toUpperCase();
+      if (/^[A-F]$/i.test(text.charAt(0))) return text.charAt(0).toUpperCase();
+    }
+
+    return '';
+  };
+
+  const getExamOptionClickTarget = (input) =>
+    (input.id ? document.querySelector(`label[for="${escapeCss(input.id)}"]`) : null) ||
+    input.closest('label') ||
+    input.parentElement ||
+    input;
+
+  const getExamTextOptionGroups = () => {
+    const groups = new Map();
+    const selectors = 'label,button,a,span,div,p,li';
+
+    for (const doc of allDocs()) {
+      for (const el of doc.querySelectorAll(selectors)) {
+        if (!isVisible(el) || isDisabled(el)) continue;
+
+        const text = norm(el.textContent || '');
+        if (!text || text.length > 120) continue;
+
+        const letter = extractExamOptionLetterFromText(text);
+        if (!letter) continue;
+
+        const hasChildOption = Array.from(el.children || []).some((child) =>
+          isVisible(child) && !!extractExamOptionLetterFromText(norm(child.textContent || ''))
+        );
+        if (hasChildOption) continue;
+
+        const container =
+          el.closest('[class*="question"],[class*="topic"],[class*="subject"],[class*="problem"],.el-form-item,fieldset,table,tr,ul,ol,li') ||
+          el.parentElement ||
+          el;
+        const top = container?.getBoundingClientRect?.().top ?? Number.POSITIVE_INFINITY;
+        const key = `${container.tagName}:${Math.round(top)}`;
+
+        if (!groups.has(key)) {
+          groups.set(key, {
+            key: `text:${key}`,
+            type: 'text',
+            inputs: [],
+            top,
+          });
+        }
+
+        const group = groups.get(key);
+        if (group.inputs.some((item) => item.letter === letter)) continue;
+        group.inputs.push({
+          input: null,
+          letter,
+          target: getClickableTarget(el) || el,
+        });
+      }
+    }
+
+    return Array.from(groups.values())
+      .filter((group) => group.inputs.length >= 2)
+      .sort((a, b) => a.top - b.top);
+  };
+
+  const getExamQuestionGroups = () => {
+    const groups = new Map();
+    const inputs = [];
+
+    for (const doc of allDocs()) {
+      inputs.push(...Array.from(doc.querySelectorAll('input[type="radio"],input[type="checkbox"]')));
+    }
+
+    inputs.forEach((input, index) => {
+      if (!isExamInputUsable(input)) return;
+      const key = getExamQuestionGroupKey(input, index);
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          type: String(input.type || ''),
+          inputs: [],
+          top: Number.POSITIVE_INFINITY,
+        });
+      }
+      const group = groups.get(key);
+      const target = getExamInputVisibilityTarget(input);
+      const top = target?.getBoundingClientRect?.().top ?? Number.POSITIVE_INFINITY;
+      group.top = Math.min(group.top, top);
+      group.inputs.push({
+        input,
+        letter: detectOptionLetter(input),
+        target: getExamOptionClickTarget(input),
+      });
+    });
+
+    const inputGroups = Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        inputs: group.inputs.filter((item) => item.letter),
+      }))
+      .filter((group) => group.inputs.length > 0)
+      .sort((a, b) => a.top - b.top);
+
+    if (inputGroups.length > 0) {
+      return inputGroups;
+    }
+
+    return getExamTextOptionGroups();
+  };
+
+  const chooseExamOption = (item) => {
+    if (!item) return false;
+
+    const target = item.target;
+    if (target && isVisible(target) && !isDisabled(target)) {
+      if (item.input && clickElOnce(target)) {
+        return true;
+      }
+      if (!item.input && forceClickEl(target)) {
+        return true;
+      }
+    }
+
+    try {
+      if (item.input) {
+        item.input.checked = true;
+        item.input.dispatchEvent(new Event('input', { bubbles: true }));
+        item.input.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+    } catch (_) {
+      return false;
+    }
+
+    return false;
+  };
+
+  const getExamVisibleOptionSequences = () => {
+    const raw = getExamRawOptionCandidates()
+      .filter((item) => /^[A-D]$/.test(item.letter))
+      .sort((a, b) => a.top - b.top || a.left - b.left);
+
+    const groups = [];
+    let current = [];
+    const flush = () => {
+      const letters = Array.from(new Set(current.map((item) => item.letter)));
+      if (current.length >= 2 && letters.length >= 2) {
+        groups.push(current);
+      }
+      current = [];
+    };
+
+    for (const item of raw) {
+      if (item.letter === 'A' && current.some((candidate) => candidate.letter === 'A')) {
+        flush();
+      }
+      if (!current.some((candidate) => candidate.letter === item.letter)) {
+        current.push(item);
+      }
+      if (current.length >= 4) {
+        flush();
+      }
+    }
+    flush();
+
+    return groups.map((items, index) => ({
+      index: index + 1,
+      letters: items.map((item) => item.letter),
+      items,
+      top: Math.min(...items.map((item) => item.top)),
+    }));
+  };
+
+  const answerExamByVisibleOptionSequences = () => {
+    if (!CFG.exam.autoSelectBySheet) return false;
+
+    const sheet = getExamAnswerSheet();
+    if (!sheet.paperNo || !sheet.answers.length) return false;
+
+    const groups = getExamVisibleOptionSequences();
+    if (groups.length === 0) return false;
+
+    let applied = 0;
+    const details = [];
+    const count = Math.min(sheet.answers.length, groups.length);
+    for (let i = 0; i < count; i += 1) {
+      const answer = String(sheet.answers[i] || '').toUpperCase();
+      const group = groups[i];
+      const option = group.items.find((item) => item.letter === answer);
+      if (!option) {
+        details.push(`Q${i + 1}:${answer}:missing:${group.letters.join('')}`);
+        continue;
+      }
+      if (chooseExamOption(option)) {
+        applied += 1;
+        details.push(`Q${i + 1}:${answer}:ok`);
+      } else {
+        details.push(`Q${i + 1}:${answer}:fail`);
+      }
+    }
+
+    log('exam visible option sequence applied:', `${applied}/${count}`, details.join(' | '));
+    return applied > 0;
+  };
+
+  const answerExamBySheet = () => {
+    if (!CFG.exam.autoSelectBySheet) return false;
+
+    const sheet = getExamAnswerSheet();
+    if (!sheet.paperNo || !sheet.answers.length) return false;
+
+    const groups = getExamQuestionGroups();
+    if (groups.length === 0) {
+      log('exam question groups not found yet');
+      return false;
+    }
+
+    let applied = 0;
+    const details = [];
+    for (let i = 0; i < Math.min(groups.length, sheet.answers.length); i += 1) {
+      const answer = String(sheet.answers[i] || '').toUpperCase();
+      const group = groups[i];
+      const option = group.inputs.find((item) => item.letter === answer);
+      if (!option) {
+        details.push(`Q${i + 1}:${answer}:missing`);
+        continue;
+      }
+      if (chooseExamOption(option)) {
+        applied += 1;
+        details.push(`Q${i + 1}:${answer}:ok`);
+      } else {
+        details.push(`Q${i + 1}:${answer}:fail`);
+      }
+    }
+
+    log('exam answer sheet applied:', sheet.paperNo, `${applied}/${Math.min(groups.length, sheet.answers.length)}`, details.join(' | '));
+    return applied > 0;
+  };
+
+  const waitForExamQuestionChange = async (prevSignature, prevIndex, timeoutMs = 8000) => {
+    const startedAt = now();
+    while (now() - startedAt < timeoutMs) {
+      await sleep(400);
+      const currentIndex = getExamCurrentQuestionIndex();
+      const currentSignature = getExamQuestionSignature();
+      if (currentIndex && prevIndex && currentIndex !== prevIndex) {
+        return true;
+      }
+      if (currentSignature && prevSignature && currentSignature !== prevSignature) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const answerExamStepByStep = async () => {
+    const sheet = getExamAnswerSheet();
+    if (!sheet.paperNo || !sheet.answers.length) return false;
+
+    const startButton = findExamStartButton();
+    if (startButton) {
+      log('exam start button detected:', norm(startButton.textContent || ''));
+      clickElOnce(startButton);
+      await sleep(Math.max(1000, CFG.examAutoStartDelayMs));
+    }
+
+    let answeredCount = 0;
+    let expectedIndex = getExamCurrentQuestionIndex() || 1;
+    const stepLimit = Math.max(sheet.answers.length * 2, 6);
+
+    for (let step = 0; step < stepLimit; step += 1) {
+      const currentIndex = getExamCurrentQuestionIndex() || expectedIndex;
+      const answer = sheet.answers[currentIndex - 1];
+      if (!answer) {
+        log('exam current question index out of range:', currentIndex, sheet.answers.length);
+        break;
+      }
+
+      const optionState = getExamCurrentQuestionOptions();
+      log(
+        'exam current option scope:',
+        `Q${currentIndex}`,
+        optionState.letters.join(',') || 'none',
+        optionState.items.map((item) => `${item.letter}:${item.text.slice(0, 40)}`).join(' | ')
+      );
+
+      const option = optionState.items.find((item) => item.letter === answer);
+      if (!option) {
+        log('exam target option missing:', `Q${currentIndex}`, answer, optionState.letters.join(',') || 'none');
+        return false;
+      }
+
+      if (!chooseExamOption(option)) {
+        log('exam choose option failed:', `Q${currentIndex}`, answer);
+        return false;
+      }
+
+      answeredCount += 1;
+      log('exam step answered:', `Q${currentIndex}`, answer);
+      await sleep(600);
+
+      if (currentIndex >= sheet.answers.length) {
+        return answeredCount > 0;
+      }
+
+      const nextButton = findExamNextButton();
+      if (!nextButton) {
+        log('exam next button not found after answer:', `Q${currentIndex}`);
+        return answeredCount > 0;
+      }
+
+      const prevSignature = getExamQuestionSignature();
+      clickElOnce(nextButton);
+      await waitForExamQuestionChange(prevSignature, currentIndex);
+      expectedIndex = currentIndex + 1;
+    }
+
+    return answeredCount > 0;
+  };
+
+  const findExamSubmitButtons = () => {
+    const candidates = [];
+    const selectors = 'button,a,span,div,[role="button"],input[type="button"],input[type="submit"],.el-button';
+    const regex = /^(?:\u63d0\u4ea4|\u63d0\u4ea4\u8bd5\u5377|\u63d0\u4ea4\u7b54\u6848|\u786e\u8ba4\u4ea4\u5377|\u786e\u8ba4\u63d0\u4ea4|\u4ea4\u5377|\u5b8c\u6210\u7b54\u9898|\u6211\u8981\u4ea4\u5377)$/;
+    for (const el of queryAllDeep(selectors)) {
+      const text = getExamActionText(el);
+      const compactText = getExamActionCompactText(el);
+      if (!text || !regex.test(compactText) || !isVisible(el) || isDisabled(el)) continue;
+      if (text.length > 30) continue;
+      const target = getClickableTarget(el) || el;
+      if (target && isVisible(target) && !isDisabled(target)) {
+        candidates.push(target);
+      }
+    }
+
+    const styled = findExamPrimaryActionButtons();
+    return uniq([...candidates, ...styled]).sort((a, b) => {
+      const aText = getExamActionCompactText(a);
+      const bText = getExamActionCompactText(b);
+      const aExact = /^(?:\u63d0\u4ea4|\u4ea4\u5377|\u63d0\u4ea4\u8bd5\u5377|\u786e\u8ba4\u63d0\u4ea4|\u786e\u8ba4\u4ea4\u5377)$/.test(aText) ? 0 : 1;
+      const bExact = /^(?:\u63d0\u4ea4|\u4ea4\u5377|\u63d0\u4ea4\u8bd5\u5377|\u786e\u8ba4\u63d0\u4ea4|\u786e\u8ba4\u4ea4\u5377)$/.test(bText) ? 0 : 1;
+      if (aExact !== bExact) return aExact - bExact;
+      const aScore = Number(a.dataset.ncmeExamActionScore || 0);
+      const bScore = Number(b.dataset.ncmeExamActionScore || 0);
+      if (aScore !== bScore) return bScore - aScore;
+      return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+    });
+  };
+
+  const parseRgb = (value) => {
+    const match = String(value || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([0-9.]+))?\)/i);
+    if (!match) return null;
+    return {
+      r: Number(match[1]) || 0,
+      g: Number(match[2]) || 0,
+      b: Number(match[3]) || 0,
+      a: match[4] === undefined ? 1 : Number(match[4]) || 0,
+    };
+  };
+
+  const isBlueColor = (value) => {
+    const rgb = parseRgb(value);
+    if (!rgb || rgb.a < 0.2) return false;
+    return rgb.b >= 150 && rgb.r <= 120 && rgb.g >= 80 && rgb.g <= 180;
+  };
+
+  const findExamPrimaryActionButtons = () => {
+    const scored = [];
+    for (const el of queryAllDeep('button,a,span,div,[role="button"],input[type="button"],input[type="submit"],.el-button')) {
+      if (!isVisible(el) || isDisabled(el)) continue;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 28 || rect.width > 420 || rect.height > 90) continue;
+
+      const view = el.ownerDocument?.defaultView || window;
+      const style = view.getComputedStyle(el);
+      const text = getExamActionText(el);
+      const compactText = getExamActionCompactText(el);
+      const cls = String(el.className || '');
+      const bgBlue = isBlueColor(style.backgroundColor);
+      const borderBlue = isBlueColor(style.borderColor);
+      const looksClickable =
+        style.cursor === 'pointer' ||
+        typeof el.onclick === 'function' ||
+        el.matches?.('button,a,[role="button"],input,.el-button,[class*="btn"],[class*="button"]');
+      const looksSubmitText = /(?:\u63d0\u4ea4|\u4ea4\u5377|submit)/i.test(compactText);
+      const rightSide = rect.left > (view.innerWidth || document.documentElement.clientWidth || 0) * 0.45;
+      const wideButton = rect.width >= 120 && rect.height >= 34;
+
+      let score = 0;
+      if (bgBlue) score += 60;
+      if (borderBlue) score += 20;
+      if (looksSubmitText) score += 100;
+      if (looksClickable) score += 20;
+      if (rightSide) score += 20;
+      if (wideButton) score += 20;
+      if (/primary|submit|sure|confirm|btn|button|el-button/i.test(cls)) score += 15;
+      if (/(?:\u4fdd\u5b58\u8fdb\u5ea6|\u8fd4\u56de|\u8ba1\u7b97\u5668|\u7b54\u9898\u5361|\u6536\u8d77)/.test(compactText)) score -= 80;
+      if (/^[A-D]$/.test(text)) score -= 100;
+
+      if (score < 70) continue;
+
+      const target = getClickableTarget(el) || el;
+      if (!target || !isVisible(target) || isDisabled(target)) continue;
+      target.dataset.ncmeExamActionScore = String(score);
+      scored.push(target);
+    }
+
+    return uniq(scored);
+  };
+
+  const findExamConfirmButtons = () => {
+    const candidates = [];
+    const regex = /^(?:\u786e\u5b9a|\u786e\u8ba4|\u63d0\u4ea4|\u4ea4\u5377|\u7ed3\u675f|\u7ed3\u675f\u7ec3\u4e60|\u662f|\u7ee7\u7eed|\u77e5\u9053\u4e86)$/;
+    const dialogScopes = [];
+    for (const doc of allDocs()) {
+      dialogScopes.push(...Array.from(doc.querySelectorAll('.el-message-box,.el-dialog,[role="dialog"],.modal,.dialog')));
+    }
+
+    for (const scope of dialogScopes.filter(Boolean)) {
+      for (const el of Array.from(scope.querySelectorAll?.('button,a,span,div,[role="button"],input[type="button"],input[type="submit"],.el-button') || [])) {
+        const text = getExamActionText(el);
+        const compactText = getExamActionCompactText(el);
+        if (!text || text.length > 20 || (!regex.test(text) && !regex.test(compactText))) continue;
+        if (!isVisible(el) || isDisabled(el)) continue;
+        const target = getClickableTarget(el) || el;
+        if (target && isVisible(target) && !isDisabled(target)) {
+          candidates.push(target);
+        }
+      }
+    }
+
+    if (candidates.length > 0) {
+      return uniq(candidates).sort((a, b) => {
+        const aText = getExamActionCompactText(a);
+        const bText = getExamActionCompactText(b);
+        const scoreText = (text) => {
+          if (/^\u7ed3\u675f\u7ec3\u4e60$/.test(text)) return 0;
+          if (/^\u7ed3\u675f$/.test(text)) return 1;
+          if (/^\u786e\u8ba4$/.test(text)) return 2;
+          if (/^\u786e\u5b9a$/.test(text)) return 3;
+          if (/^\u63d0\u4ea4$/.test(text)) return 4;
+          if (/^\u4ea4\u5377$/.test(text)) return 5;
+          return 9;
+        };
+        const diff = scoreText(aText) - scoreText(bText);
+        if (diff !== 0) return diff;
+        return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+      });
+    }
+
+    return uniq(findExamPrimaryActionButtons()).sort((a, b) => {
+      const aScore = Number(a.dataset.ncmeExamActionScore || 0);
+      const bScore = Number(b.dataset.ncmeExamActionScore || 0);
+      if (aScore !== bScore) return bScore - aScore;
+      return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+    });
+  };
+
+  const submitExamByUi = async () => {
+    const buttons = findExamSubmitButtons();
+    const first = buttons[0];
+    if (!first) return false;
+
+    log('submit exam by ui:', getExamActionText(first));
+    forceClickEl(first) || clickElOnce(first);
+    await sleep(1200);
+
+    const confirms = [
+      ...findExamConfirmButtons().filter((el) => el !== first),
+      ...findExamSubmitButtons().filter((el) => el !== first),
+    ];
+    const confirm = confirms.find((el) => /(?:\u7ed3\u675f\u7ec3\u4e60|\u7ed3\u675f|\u786e\u8ba4|\u786e\u5b9a|\u63d0\u4ea4|\u4ea4\u5377)/.test(getExamActionCompactText(el))) || confirms[0];
+    if (confirm) {
+      log('confirm submit exam by ui:', getExamActionText(confirm));
+      forceClickEl(confirm) || clickElOnce(confirm);
+      await sleep(800);
+    }
+    return true;
+  };
+
+  const submitExamPaper = async (payload) => {
+    const auth = getUserAuthInfo();
+    const headers = {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      channel: 'pc',
+    };
+    if (auth.header) {
+      headers.authorization = auth.header;
+    }
+
+    const resp = await fetch('/resourceApi/web/exam/paper/submitPaper', {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    const text = await resp.text();
+    const json = safeJsonParse(text, null);
+    examRuntime.lastSubmitPayload = payload;
+    examRuntime.lastSubmitResponse = json || text;
+    pushExamApiLog({
+      kind: 'auto-submit',
+      stage: 'response',
+      url: '/resourceApi/web/exam/paper/submitPaper',
+      method: 'POST',
+      status: resp.status,
+      body: liteValue(json || text, 0),
+    });
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      data: json || text,
+    };
+  };
+
+  const maybeAutoSubmitExam = async () => {
+    if (!CFG.exam.enabled || !CFG.exam.autoSubmit) return false;
+    if (examSubmitInProgress) return true;
+    if (examAutoStarted) return true;
+
+    const built = buildExamSubmitPayload();
+    if (!built) return false;
+
+    const context = getExamContext();
+    if (!context.periodId || !context.sourceType || !context.topicId) {
+      log('exam context incomplete, wait for more api data');
+      return false;
+    }
+
+    examAutoStarted = true;
+    examSubmitInProgress = true;
+
+    try {
+      log('auto submit exam start:', built.key, context.topicId, built.payload.questions.length);
+      void sendNotify('EXAM', '开始自动提交考试答案', [
+        context.topicId ? `topicId: ${context.topicId}` : '',
+        context.periodId ? `periodId: ${context.periodId}` : '',
+        `questions: ${built.payload.questions.length}`,
+        built.key ? `config: ${built.key}` : '',
+      ], {
+        intervalMs: 5000,
+        key: `exam-start:${hashText(String(context.topicId || built.key || 'default'))}`,
+      });
+      const result = await submitExamPaper(built.payload);
+      examCompletedAt = now();
+      log('auto submit exam result:', result.status, result.data);
+      void sendNotify('EXAM', '考试答案已自动提交', [
+        context.topicId ? `topicId: ${context.topicId}` : '',
+        `status: ${result.status}`,
+      ], {
+        intervalMs: 5000,
+        key: `exam-submit:${hashText(String(context.topicId || built.key || 'default'))}`,
+      });
+      return true;
+    } catch (err) {
+      examAutoStarted = false;
+      logError('auto submit exam failed:', err);
+      void notifyError('考试自动提交失败', err, [
+        context.topicId ? `topicId: ${context.topicId}` : '',
+        context.periodId ? `periodId: ${context.periodId}` : '',
+      ], {
+        key: `exam-submit-failed:${hashText(String(context.topicId || 'unknown'))}`,
+      });
+      return false;
+    } finally {
+      examSubmitInProgress = false;
+    }
+  };
+
+  const maybeAutoHandleExam = async () => {
+    if (!CFG.exam.enabled) return false;
+    if (examSubmitInProgress) return true;
+    if (examAutoStarted) return true;
+
+    const directSubmitDone = await maybeAutoSubmitExam();
+    if (directSubmitDone) return true;
+
+    if (!CFG.exam.autoSelectBySheet) return false;
+
+    const sheet = getExamAnswerSheet();
+    if (!sheet.paperNo || !sheet.sequence) {
+      const context = getExamContext();
+      log(
+        'exam paper number not recognized, skip sheet answering',
+        'title=',
+        sheet.title || '(empty)',
+        'detected=',
+        sheet.detectedPaperNo || 0,
+        'resolved=',
+        sheet.paperNo || 0,
+        'topicId=',
+        context.topicId || '(empty)'
+      );
+      return false;
+    }
+
+    examAutoStarted = true;
+    try {
+      let answered = false;
+      const visibleAnswered = answerExamByVisibleOptionSequences();
+      if (visibleAnswered) {
+        answered = true;
+        await sleep(800);
+      } else {
+        const modelAnswered = applyExamAnswersByModel();
+        if (modelAnswered) {
+          answered = true;
+          await sleep(800);
+        } else {
+          const groups = getExamQuestionGroups();
+          answered = groups.length >= sheet.answers.length
+            ? answerExamBySheet()
+            : await answerExamStepByStep();
+        }
+      }
+      if (!answered) {
+        examAutoStarted = false;
+        return false;
+      }
+
+      void sendNotify('EXAM', '已按答案表自动作答', [
+        sheet.paperNo ? `paper: ${sheet.paperNo}` : '',
+        sheet.sequence ? `answers: ${sheet.sequence}` : '',
+      ], {
+        intervalMs: 5000,
+        key: `exam-sheet-answered:${sheet.paperNo}`,
+      });
+
+      await sleep(CFG.nextDelayMs);
+      await navigateExamToSubmit(sheet.answers.length + 2);
+      const submitted = await submitExamByUi();
+      if (submitted) {
+        examCompletedAt = now();
+        void sendNotify('EXAM', '已自动提交考试页面', [
+          sheet.paperNo ? `paper: ${sheet.paperNo}` : '',
+        ], {
+          intervalMs: 5000,
+          key: `exam-sheet-submit:${sheet.paperNo}`,
+        });
+      } else {
+        examAutoStarted = false;
+      }
+      return submitted;
+    } catch (err) {
+      examAutoStarted = false;
+      logError('sheet exam automation failed:', err);
+      void notifyError('考试页面自动作答失败', err, [
+        sheet.paperNo ? `paper: ${sheet.paperNo}` : '',
+        sheet.sequence ? `answers: ${sheet.sequence}` : '',
+      ], {
+        key: `exam-sheet-failed:${sheet.paperNo || 'unknown'}`,
+      });
+      return false;
+    }
+  };
+
+  const resetExamAutomationState = () => {
+    examAutoStarted = false;
+    examSubmitInProgress = false;
+    examCompletedAt = 0;
+    examRuntime.lastSubmitPayload = null;
+    examRuntime.lastSubmitResponse = null;
+    return true;
+  };
+
+  const tryStartExamFromList = (snapshot, progressText, unitItem = null, nextRowTop = Number.POSITIVE_INFINITY) => {
+    const scopedVideos = unitItem ? getPlayEntriesForUnitScope(unitItem, nextRowTop) : [];
+    const pendingScopedVideo = scopedVideos.find((item) => isPendingLessonText(item.rowText));
+    if (pendingScopedVideo) {
+      return false;
+    }
+
+    const entry = unitItem
+      ? getExamEntriesForUnitScope(unitItem, nextRowTop).find((item) => isPendingExamEntry(item))
+      : getPendingExamEntry();
+    if (!entry) return false;
+    const plannedExam = getExamPlanEntryByTitle(entry.title) || getExamPlanEntryByTitle(entry.rowText);
+
+    const lockKey = `list-exam:${hashText(entry.rowText || entry.title || norm(entry.button.textContent || ''))}`;
+    if (isListPlayLocked() && lastListPlayKey === lockKey) {
+      return true;
+    }
+
+    log('click exam button:', entry.title, entry.status, norm(entry.button.textContent || ''));
+    beginListPlayLock(lockKey, entry.title);
+    beginNavigation(`list-exam:${entry.status || 'pending'}`, entry.title);
+    if (plannedExam?.paperNo) {
+      setExpectedExam(plannedExam.paperNo, {
+        title: plannedExam.title || entry.title || '',
+        source: 'list-exam-click',
+      });
+      log('expected exam paper set:', plannedExam.paperNo, plannedExam.title || entry.title || '');
+    }
+
+    if (clickElOnce(entry.button)) {
+      void sendNotify('LIST', '\u4ece\u8bfe\u7a0b\u76ee\u5f55\u8fdb\u5165\u8bd5\u5377', [
+        snapshot?.courseTitle ? `\u8bfe\u7a0b: ${snapshot.courseTitle}` : '',
+        entry.title ? `\u5185\u5bb9: ${entry.title}` : '',
+        entry.status ? `\u72b6\u6001: ${entry.status}` : '',
+        `\u6574\u4f53\u8fdb\u5ea6: ${progressText}`,
+        `\u6309\u94ae: ${norm(entry.button.textContent || '')}`,
+      ], {
+        intervalMs: 5000,
+        key: `list-exam-click:${hashText(entry.rowText || entry.title)}`,
+      });
+      removeStorage(STORAGE.returningToList);
+      return true;
+    }
+
+    clearListPlayLock('exam-click-failed');
+    resetNavigationState('exam-click-failed');
     return false;
   };
 
@@ -1646,7 +4000,28 @@
       snapshot && snapshot.totalLessons > 0
         ? `${snapshot.completedLessons} / ${snapshot.totalLessons}`
         : '未知';
+    const headers = getUnitHeaderElements();
+    const currentUnitIndex = headers.findIndex((row) => {
+      const text = norm(row.textContent || '');
+      const status = inferStudyStatus(text);
+      return status === '鏈涔?' || status === '瀛︿範涓?' || CFG.unitPendingText.test(text);
+    });
+    const currentUnit = currentUnitIndex >= 0 ? headers[currentUnitIndex] : null;
+    const currentUnitTop = currentUnit?.getBoundingClientRect().top ?? Number.NEGATIVE_INFINITY;
+    const currentNextRowTop = currentUnitIndex >= 0
+      ? headers[currentUnitIndex + 1]?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY
+      : Number.POSITIVE_INFINITY;
+
+    if (tryStartExamFromList(snapshot, progressText, currentUnit, currentNextRowTop)) {
+      return true;
+    }
+
     const entries = getCourseListPlayEntries()
+      .filter((entry) => {
+        if (!currentUnit) return true;
+        const rect = entry.button.getBoundingClientRect();
+        return rect.top > currentUnitTop + 10 && rect.top < currentNextRowTop - 10;
+      })
       .sort((a, b) => a.button.getBoundingClientRect().top - b.button.getBoundingClientRect().top);
 
     for (const entry of entries) {
@@ -1803,6 +4178,11 @@
     }
 
     if (!/\/player\/record/.test(location.pathname)) {
+      if (navigationReason.startsWith('list-exam:')) {
+        clearListPlayLock('arrived-exam');
+        resetNavigationState('arrived-exam');
+        return;
+      }
       resetNavigationState('left-player');
       return;
     }
@@ -1907,15 +4287,37 @@
     rememberListUrl();
     maybeRecoverNavigation();
 
-    if (/\/study-course\//.test(location.pathname)) {
-      collectCourseSnapshot();
+    const onExamReportPage = isExamReportPage();
+    const onExamPage = !onExamReportPage && isExamPage();
+
+    if (!onExamReportPage && !onExamPage && (examSessionKey || examAutoStarted || examSubmitInProgress || examCompletedAt)) {
+      resetExamAutomationState('leave-exam-surface');
+      clearExamSessionState('leave-exam-surface');
     }
 
-    if (isExamPage()) {
-      if (allowNotify('exam-log', 30 * 1000)) {
-        log('exam page detected, skip automation');
+    if (/\/study-course\//.test(location.pathname)) {
+      collectCourseSnapshot();
+      collectExamPlanFromCourseStudy();
+    }
+
+    if (onExamReportPage) {
+      syncExamSessionState();
+      if (allowNotify('exam-report-log', 30 * 1000)) {
+        log('exam report page detected, automation enabled');
       }
-      const course = getCourseProgressContext();
+      void handleExamReportPage();
+      return;
+    }
+
+    if (onExamPage) {
+      syncExamSessionState();
+      if (allowNotify('exam-log', 30 * 1000)) {
+        log('exam page detected, automation enabled');
+      }
+      installExamApiHooks();
+      installExamFocusShield();
+      void maybeAutoHandleExam();
+      return;
       void sendNotify('WARN', '检测到考试页面，已停止自动处理', [
         course.courseTitle ? `课程: ${course.courseTitle}` : '',
         `整体进度: ${course.overallText}`,
@@ -2003,6 +4405,156 @@
         clearActivePlayer('manual');
         return true;
       }),
+      getExamState: () => runSafely('manual getExamState', () => ({
+        context: liteValue(getExamContext(), 0),
+        sheet: liteValue(getExamAnswerSheet(), 0),
+        currentQuestionIndex: getExamCurrentQuestionIndex(),
+        questionModel: liteValue((() => {
+          const model = getExamQuestionModel();
+          if (!model) return null;
+          return {
+            root: model.root,
+            path: model.path,
+            summary: model.summary,
+            questions: model.questions.map((question) => ({
+              code: question.code,
+              questionNum: question.questionNum,
+              no: question.no,
+              userAnswer: question.userAnswer,
+              status: question.status,
+              userDoQuestionStatus: question.userDoQuestionStatus,
+            })),
+          };
+        })(), 0),
+        currentQuestionOptions: liteValue({
+          letters: getExamCurrentQuestionOptions().letters,
+          items: getExamCurrentQuestionOptions().items.map((item) => ({
+            letter: item.letter,
+            text: item.text,
+            source: item.source,
+          })),
+        }, 0),
+        questionGroups: liteValue(getExamQuestionGroups().map((group) => ({
+          key: group.key,
+          type: group.type,
+          options: group.inputs.map((item) => item.letter),
+        })), 0),
+        selectedConfig: liteValue(selectExamPayloadConfig(), 0),
+        lastPaperData: liteValue(examRuntime.lastPaperData, 0),
+        lastSubmitPayload: liteValue(examRuntime.lastSubmitPayload, 0),
+        lastSubmitResponse: liteValue(examRuntime.lastSubmitResponse, 0),
+        reportSummary: liteValue(getExamReportSummary(), 0),
+        sessionKey: examSessionKey,
+        submitInProgress: examSubmitInProgress,
+        autoStarted: examAutoStarted,
+        completedAt: examCompletedAt,
+      })),
+      getExamAnswerSheet: () => runSafely('manual getExamAnswerSheet', getExamAnswerSheet),
+      getExamReportSummary: () => runSafely('manual getExamReportSummary', () => liteValue(getExamReportSummary(), 0)),
+      getExamApiLog: () => runSafely('manual getExamApiLog', () => examRuntime.apiLog.slice()),
+      getExamCurrentQuestionIndex: () => runSafely('manual getExamCurrentQuestionIndex', getExamCurrentQuestionIndex),
+      getExamQuestionModel: () => runSafely('manual getExamQuestionModel', () => {
+        const model = getExamQuestionModel();
+        if (!model) return null;
+        return liteValue({
+          root: model.root,
+          path: model.path,
+          summary: model.summary,
+          questions: model.questions.map((question) => ({
+            code: question.code,
+            questionNum: question.questionNum,
+            no: question.no,
+            userAnswer: question.userAnswer,
+            status: question.status,
+            userDoQuestionStatus: question.userDoQuestionStatus,
+          })),
+        }, 0);
+      }),
+      getExamCurrentQuestionOptions: () => runSafely('manual getExamCurrentQuestionOptions', () => liteValue({
+        letters: getExamCurrentQuestionOptions().letters,
+        items: getExamCurrentQuestionOptions().items.map((item) => ({
+          letter: item.letter,
+          text: item.text,
+          source: item.source,
+        })),
+      }, 0)),
+      getExamRawOptionCandidates: () => runSafely('manual getExamRawOptionCandidates', () => liteValue(
+        getExamRawOptionCandidates().map((item) => ({
+          letter: item.letter,
+          text: item.text,
+          source: item.source,
+          top: Math.round(item.top),
+          left: Math.round(item.left),
+          tag: item.target?.tagName || '',
+          cls: item.target?.className || '',
+        })),
+        0
+      )),
+      getExamVisibleOptionSequences: () => runSafely('manual getExamVisibleOptionSequences', () => liteValue(
+        getExamVisibleOptionSequences().map((group) => ({
+          index: group.index,
+          letters: group.letters,
+          items: group.items.map((item) => ({
+            letter: item.letter,
+            text: item.text,
+            source: item.source,
+            tag: item.target?.tagName || '',
+            cls: item.target?.className || '',
+          })),
+        })),
+        0
+      )),
+      findExamSubmitButtons: () => runSafely('manual findExamSubmitButtons', () => liteValue(
+        findExamSubmitButtons().map((el) => ({
+          tag: el.tagName,
+          cls: el.className || '',
+          text: norm(el.textContent || ''),
+          score: el.dataset?.ncmeExamActionScore || '',
+        })),
+        0
+      )),
+      findExamPrimaryActionButtons: () => runSafely('manual findExamPrimaryActionButtons', () => liteValue(
+        findExamPrimaryActionButtons().map((el) => ({
+          tag: el.tagName,
+          cls: el.className || '',
+          text: norm(el.textContent || ''),
+          score: el.dataset?.ncmeExamActionScore || '',
+          rect: {
+            top: Math.round(el.getBoundingClientRect().top),
+            left: Math.round(el.getBoundingClientRect().left),
+            width: Math.round(el.getBoundingClientRect().width),
+            height: Math.round(el.getBoundingClientRect().height),
+          },
+        })),
+        0
+      )),
+      findExamConfirmButtons: () => runSafely('manual findExamConfirmButtons', () => liteValue(
+        findExamConfirmButtons().map((el) => ({
+          tag: el.tagName,
+          cls: el.className || '',
+          text: norm(el.textContent || ''),
+          score: el.dataset?.ncmeExamActionScore || '',
+        })),
+        0
+      )),
+      answerExamByVisibleOptionSequences: () => runSafely('manual answerExamByVisibleOptionSequences', answerExamByVisibleOptionSequences),
+      applyExamAnswersByModel: () => runSafely('manual applyExamAnswersByModel', applyExamAnswersByModel),
+      setExamPayloadConfigs: (value) => runSafely('manual setExamPayloadConfigs', () => {
+        const parsed = safeJsonParse(value, value);
+        setExamPayloadConfigs(parsed);
+        return true;
+      }),
+      getExamPayloadConfigs: () => runSafely('manual getExamPayloadConfigs', getExamPayloadConfigs),
+      clearExamPayloadConfigs: () => runSafely('manual clearExamPayloadConfigs', () => {
+        removeStorage(STORAGE.examPayloads);
+        return true;
+      }),
+      installExamFocusShield: () => runSafely('manual installExamFocusShield', installExamFocusShield),
+      resetExamAutomation: () => runSafely('manual resetExamAutomation', resetExamAutomationState),
+      autoHandleExam: () => runSafely('manual autoHandleExam', maybeAutoHandleExam),
+      handleExamReportPage: () => runSafely('manual handleExamReportPage', handleExamReportPage),
+      autoSubmitExam: () => runSafely('manual autoSubmitExam', maybeAutoSubmitExam),
+      answerExamStepByStep: () => runSafely('manual answerExamStepByStep', answerExamStepByStep),
       startTrace: () => runSafely('manual startTrace', () => {
         traceLog.length = 0;
         traceEnabled = true;
@@ -2018,6 +4570,8 @@
       getCourseStudyVmData: () => runSafely('manual getCourseStudyVmData', getCourseStudyVmData),
       getCourseStudyMethodSources: () => runSafely('manual getCourseStudyMethodSources', getCourseStudyMethodSources),
       getCourseStudyList: () => runSafely('manual getCourseStudyList', () => liteValue(getCourseStudyList(), 0)),
+      getExamPlan: () => runSafely('manual getExamPlan', () => liteValue(getExamPlan() || collectExamPlanFromCourseStudy(), 0)),
+      getExamParamMap: () => runSafely('manual getExamParamMap', () => liteValue(getExamParamMap(), 0)),
       getPendingCourseItemByVue: () => runSafely('manual getPendingCourseItemByVue', () => liteValue(getPendingCourseItemByVue(), 0)),
       expandPendingUnitByVue: () => runSafely('manual expandPendingUnitByVue', expandPendingUnitByVue),
       getPendingUnitVueChain: () => runSafely('manual getPendingUnitVueChain', () => {
@@ -2054,6 +4608,15 @@
         return tryExpandNextPendingUnit(snapshot, progressText);
       }),
       getCourseListPlayEntries: () => runSafely('manual getCourseListPlayEntries', getCourseListPlayEntries),
+      getCourseListExamEntries: () => runSafely('manual getCourseListExamEntries', () => liteValue(
+        getCourseListExamEntries().map((entry) => ({
+          title: entry.title,
+          status: entry.status,
+          rowText: entry.rowText,
+          buttonText: norm(entry.button?.textContent || ''),
+        })),
+        0
+      )),
       getPendingPlayEntries: (includeHidden = false) => runSafely('manual getPendingPlayEntries', () => getPendingPlayEntries(!!includeHidden)),
       getCourseSnapshot: () => runSafely('manual getCourseSnapshot', () => collectCourseSnapshot() || getCourseSnapshot()),
       getUnitItems: () => runSafely('manual getUnitItems', getUnitItemsDebug),
