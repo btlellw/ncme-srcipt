@@ -60,6 +60,7 @@
     examPlan: 'ncme.auto.examPlan',
     expectedExam: 'ncme.auto.expectedExam',
     examParamMap: 'ncme.auto.examParamMap',
+    autoStopped: 'ncme.auto.stopped',
   };
 
   const CFG = {
@@ -94,6 +95,7 @@
       enabled: true,
       autoSubmit: true,
       autoSelectBySheet: true,
+      minPassingScore: 80,
       answerSheets: {
         1: 'ABCCB',
         2: 'CBBCC',
@@ -2253,8 +2255,40 @@
     }
   };
 
+  const getCourseListUrl = () => {
+    const stored = getStorage(STORAGE.listUrl) || '';
+    if (/\/study-course\//.test(stored)) return stored;
+    if (document.referrer && /\/study-course\//.test(document.referrer)) return document.referrer;
+    return CFG.fallbackCourseListUrl;
+  };
+
+  const isAutomationStopped = () => !!readJsonStorage(STORAGE.autoStopped, null);
+
+  const stopAutomation = (reason, detail = {}) => {
+    const payload = {
+      reason: reason || 'stopped',
+      detail,
+      url: location.href,
+      updatedAt: now(),
+    };
+    setStorage(STORAGE.autoStopped, JSON.stringify(payload));
+    listActionQuietUntil = now() + 24 * 60 * 60 * 1000;
+    listPlayLockUntil = Math.max(listPlayLockUntil, listActionQuietUntil);
+    navigationInProgress = false;
+    examAutoStarted = false;
+    examSubmitInProgress = false;
+    return payload;
+  };
+
+  const resumeAutomation = () => {
+    removeStorage(STORAGE.autoStopped);
+    listActionQuietUntil = 0;
+    clearListPlayLock('manual-resume');
+    return true;
+  };
+
   const goToCourseList = (reason = 'unknown') => {
-    const listUrl = getStorage(STORAGE.listUrl) || CFG.fallbackCourseListUrl;
+    const listUrl = getCourseListUrl();
     log('go to course list:', reason, listUrl || '(history back)');
     clearActivePlayer(`return-list:${reason}`);
     beginNavigation(`list:${reason}`);
@@ -2597,6 +2631,21 @@
     return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '')}%`;
   };
 
+  const parseMetricNumber = (value) => {
+    if (value == null || value === '') return NaN;
+    const text = String(value).trim();
+    if (!text) return NaN;
+    const numeric = Number(text.replace(/[^\d.-]/g, ''));
+    return Number.isFinite(numeric) ? numeric : NaN;
+  };
+
+  const getReportScoreForThreshold = (summary) => {
+    const score = parseMetricNumber(summary?.score);
+    if (Number.isFinite(score)) return score;
+    const accuracy = parseMetricNumber(summary?.accuracy);
+    return Number.isFinite(accuracy) ? accuracy : NaN;
+  };
+
   const findNestedScalarByKey = (root, regex, depth = 0, seen = new WeakSet()) => {
     if (root == null || depth > 6) return undefined;
     if (typeof root !== 'object') return undefined;
@@ -2797,6 +2846,26 @@
       summary.correctCount && summary.totalCount ? `\u7b54\u5bf9: ${summary.correctCount} / ${summary.totalCount}` : '',
       summary.passed ? `\u7ed3\u679c: \u5df2\u901a\u8fc7` : '',
     ].filter(Boolean);
+
+    const thresholdScore = getReportScoreForThreshold(summary);
+    if (Number.isFinite(thresholdScore) && thresholdScore < Number(CFG.exam.minPassingScore || 80)) {
+      const stopped = stopAutomation('exam-score-low', {
+        score: thresholdScore,
+        minPassingScore: CFG.exam.minPassingScore,
+        paperNo: summary.paperNo || 0,
+        topicId: summary.topicId || '',
+      });
+      log('exam score below threshold, automation stopped:', thresholdScore, stopped);
+      void sendNotify('\u0045\u0052\u0052\u004f\u0052', '\u7b54\u6848\u6709\u8bef\uff0c\u5df2\u505c\u6b62\u811a\u672c', [
+        ...lines,
+        `\u9608\u503c: ${CFG.exam.minPassingScore}`,
+        `\u5f53\u524d\u9875: ${location.href}`,
+      ], {
+        intervalMs: 0,
+        key: `exam-score-low:${hashText(reportKey)}`,
+      });
+      return true;
+    }
 
     void sendNotify('\u0045\u0058\u0041\u004d', '\u8003\u8bd5\u62a5\u544a', lines, {
       intervalMs: 5000,
@@ -4290,6 +4359,13 @@
     const onExamReportPage = isExamReportPage();
     const onExamPage = !onExamReportPage && isExamPage();
 
+    if (isAutomationStopped() && !onExamReportPage) {
+      if (allowNotify('automation-stopped-log', 60 * 1000)) {
+        log('automation stopped, skip main loop:', readJsonStorage(STORAGE.autoStopped, {}));
+      }
+      return;
+    }
+
     if (!onExamReportPage && !onExamPage && (examSessionKey || examAutoStarted || examSubmitInProgress || examCompletedAt)) {
       resetExamAutomationState('leave-exam-surface');
       clearExamSessionState('leave-exam-surface');
@@ -4379,12 +4455,12 @@
         return listActionQuietUntil;
       }),
       resumeListAutomation: () => runSafely('manual resumeListAutomation', () => {
-        listActionQuietUntil = 0;
-        clearListPlayLock('manual-resume');
+        resumeAutomation();
         clearActivePlayer('manual');
         triedPendingUnits.clear();
         return true;
       }),
+      getAutomationStopped: () => runSafely('manual getAutomationStopped', () => readJsonStorage(STORAGE.autoStopped, null)),
       clearListPlayLock: () => runSafely('manual clearListPlayLock', () => {
         clearListPlayLock('manual');
         return true;
