@@ -37,6 +37,7 @@
   let examReportHandledKey = '';
   let traceHooksInstalled = false;
   let traceEnabled = false;
+  let studyCenterGuardInstalled = false;
   const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const triedPendingUnits = new Set();
   const traceLog = [];
@@ -44,6 +45,7 @@
     apiLog: [],
     context: {},
     lastPaperData: null,
+    lastReportData: null,
     lastSubmitPayload: null,
     lastSubmitResponse: null,
   };
@@ -61,6 +63,7 @@
     expectedExam: 'ncme.auto.expectedExam',
     examParamMap: 'ncme.auto.examParamMap',
     autoStopped: 'ncme.auto.stopped',
+    afterExamReturnUrl: 'ncme.auto.afterExamReturnUrl',
   };
 
   const CFG = {
@@ -96,6 +99,7 @@
       autoSubmit: true,
       autoSelectBySheet: true,
       minPassingScore: 80,
+      stopOnLowScore: true,
       answerSheets: {
         1: 'ABCCB',
         2: 'CBBCC',
@@ -684,7 +688,10 @@
     if (examHooksInstalled) return true;
     examHooksInstalled = true;
 
-    const isExamApiUrl = (url) => /\/resourceApi\/web\/exam\//.test(String(url || ''));
+    const isExamApiUrl = (url) =>
+      /\/resourceApi\//.test(String(url || '')) &&
+      /(?:exam|paper|qbank|report|score|analysis|result)/i.test(String(url || ''));
+    const isReportApiUrl = (url) => /(?:report|score|analysis|result)/i.test(String(url || ''));
 
     try {
       const originalFetch = PAGE_WINDOW.fetch;
@@ -719,7 +726,9 @@
               // Ignore clone/text failures.
             }
             absorbExamContext(json);
-            if (/submitPaper/.test(url)) {
+            if (isReportApiUrl(url)) {
+              examRuntime.lastReportData = json || text;
+            } else if (/submitPaper/.test(url)) {
               examRuntime.lastSubmitPayload = requestBody;
               examRuntime.lastSubmitResponse = json || text;
             } else if (/paper/.test(url)) {
@@ -779,7 +788,9 @@
               json = safeJsonParse(text, null);
             }
             absorbExamContext(json);
-            if (/submitPaper/.test(meta.url)) {
+            if (isReportApiUrl(meta.url)) {
+              examRuntime.lastReportData = json || text;
+            } else if (/submitPaper/.test(meta.url)) {
               examRuntime.lastSubmitPayload = requestBody;
               examRuntime.lastSubmitResponse = json || text;
             } else if (/paper/.test(meta.url)) {
@@ -2262,6 +2273,57 @@
     return CFG.fallbackCourseListUrl;
   };
 
+  const isStudyCenterMyCourseUrl = (url) => {
+    try {
+      const parsed = new URL(String(url || ''), location.origin);
+      return /\/study-center\/my-course/.test(parsed.pathname || '');
+    } catch (_) {
+      return /\/study-center\/my-course/.test(String(url || ''));
+    }
+  };
+
+  const isExamReportPath = (path = location.pathname) => /\/qbank\/do\/report\/paper/.test(String(path || ''));
+
+  const setAfterExamReturnUrl = () => {
+    const url = getCourseListUrl();
+    if (url && /\/study-course\//.test(url)) {
+      setStorage(STORAGE.afterExamReturnUrl, url);
+    }
+    return url;
+  };
+
+  const installStudyCenterReturnGuard = () => {
+    if (studyCenterGuardInstalled) return true;
+    studyCenterGuardInstalled = true;
+
+    const wrapHistory = (name) => {
+      const original = history[name];
+      if (typeof original !== 'function' || original.__ncmeAutoGuarded) return;
+
+      const guarded = function (state, title, url) {
+        if (url && isStudyCenterMyCourseUrl(url) && getStorage(STORAGE.afterExamReturnUrl)) {
+          const target = getStorage(STORAGE.afterExamReturnUrl) || getCourseListUrl();
+          if (isExamReportPath() && !examReportHandledKey) {
+            log('block study-center navigation before report handled:', String(url));
+            return original.call(this, state, title, location.href);
+          }
+          if (target && /\/study-course\//.test(target)) {
+            log('rewrite study-center navigation to course detail:', String(url), '->', target);
+            return original.call(this, state, title, target);
+          }
+        }
+        return original.call(this, state, title, url);
+      };
+
+      guarded.__ncmeAutoGuarded = true;
+      history[name] = guarded;
+    };
+
+    wrapHistory('pushState');
+    wrapHistory('replaceState');
+    return true;
+  };
+
   const isAutomationStopped = () => !!readJsonStorage(STORAGE.autoStopped, null);
 
   const stopAutomation = (reason, detail = {}) => {
@@ -2406,13 +2468,15 @@
   const getExamContext = () => {
     const route = PAGE_WINDOW.$nuxt?.$route || null;
     const query = route?.query || {};
+    const urlQuery = new URLSearchParams(location.search || '');
     return {
       ...examRuntime.context,
-      periodId: examRuntime.context.periodId || query.periodId || '',
-      sourceType: examRuntime.context.sourceType || query.sourceType || query.projectType || '',
-      topicId: examRuntime.context.topicId || query.topicId || query.id || '',
-      paperId: examRuntime.context.paperId || query.paperId || '',
-      batchId: examRuntime.context.batchId || '',
+      periodId: examRuntime.context.periodId || query.periodId || urlQuery.get('periodId') || '',
+      sourceType: examRuntime.context.sourceType || query.sourceType || query.projectType || urlQuery.get('sourceType') || '',
+      topicId: examRuntime.context.topicId || query.topicId || query.id || urlQuery.get('topicId') || '',
+      paperId: examRuntime.context.paperId || query.paperId || urlQuery.get('paperId') || '',
+      batchId: examRuntime.context.batchId || query.batchId || urlQuery.get('batchId') || '',
+      examinationCode: examRuntime.context.examinationCode || query.examinationCode || urlQuery.get('examinationCode') || '',
       route: route ? {
         path: route.path,
         fullPath: route.fullPath,
@@ -2723,25 +2787,33 @@
 
   const getExamReportSummary = () => {
     const bodyText = norm(document.body?.innerText || '');
-    const response = safeJsonParse(examRuntime.lastSubmitResponse, examRuntime.lastSubmitResponse);
+    const responseCandidates = [
+      safeJsonParse(examRuntime.lastReportData, examRuntime.lastReportData),
+      safeJsonParse(examRuntime.lastPaperData, examRuntime.lastPaperData),
+      safeJsonParse(examRuntime.lastSubmitResponse, examRuntime.lastSubmitResponse),
+    ].filter((item) => item !== undefined && item !== null && item !== '');
     const context = getExamContext();
     const sheet = getExamAnswerSheet();
 
-    const responseScore = findNestedScalarByKey(
-      response,
+    const findFromResponses = (regex) => {
+      for (const item of responseCandidates) {
+        const value = findNestedScalarByKey(item, regex);
+        if (value !== undefined && value !== null && value !== '') return value;
+      }
+      return undefined;
+    };
+
+    const responseScore = findFromResponses(
       /(?:^|_)(?:score|mark|grade)(?:$|_)|[\u5f97\u5206\u5206\u6570\u6210\u7ee9]/i,
     );
-    const responseAccuracy = findNestedScalarByKey(
-      response,
-      /(?:correct.*rate|accuracy|right.*rate|scoreRate|correctRate|accuracyRate)|[\u6b63\u786e\u7387\u7b54\u5bf9\u7387]/i,
+    const responseAccuracy = findFromResponses(
+      /(?:correct.*rate|accuracy|right.*rate|scoreRate|correctRate|accuracyRate|rightRate)|[\u6b63\u786e\u7387\u7b54\u5bf9\u7387]/i,
     );
-    const responseCorrectCount = findNestedScalarByKey(
-      response,
-      /(?:correct.*count|right.*count|correctNum|rightNum)|(?:\u6b63\u786e.*\u9898\u6570|\u7b54\u5bf9.*\u9898)/i,
+    const responseCorrectCount = findFromResponses(
+      /(?:correct.*count|right.*count|correctNum|rightNum|rightCount)|(?:\u6b63\u786e.*\u9898\u6570|\u7b54\u5bf9.*\u9898)/i,
     );
-    const responseTotalCount = findNestedScalarByKey(
-      response,
-      /(?:total.*count|question.*count|allCount|totalNum)|(?:\u603b\u9898\u6570|\u603b\u5171.*\u9898)/i,
+    const responseTotalCount = findFromResponses(
+      /(?:total.*count|question.*count|allCount|totalNum|questionNum)|(?:\u603b\u9898\u6570|\u603b\u5171.*\u9898)/i,
     );
 
     const textScore = firstMatchValue(bodyText, [
@@ -2796,7 +2868,112 @@
     };
   };
 
+  const getExamReportSummaryV2 = () => {
+    const bodyText = norm(document.body?.innerText || '');
+    const context = getExamContext();
+    const sheet = getExamAnswerSheet();
+    const responses = [
+      safeJsonParse(examRuntime.lastReportData, examRuntime.lastReportData),
+      safeJsonParse(examRuntime.lastPaperData, examRuntime.lastPaperData),
+      safeJsonParse(examRuntime.lastSubmitResponse, examRuntime.lastSubmitResponse),
+    ].filter((item) => item !== undefined && item !== null && item !== '');
+
+    const findResponseValue = (regex) => {
+      for (const item of responses) {
+        const value = findNestedScalarByKey(item, regex);
+        if (value !== undefined && value !== null && value !== '') return value;
+      }
+      return undefined;
+    };
+
+    const responseScore = findResponseValue(
+      /(?:^|_)(?:score|mark|grade|paperScore|userScore|totalScore|finalScore)(?:$|_)|[\u5f97\u5206\u5206\u6570\u6210\u7ee9]/i,
+    );
+    const responseAccuracy = findResponseValue(
+      /(?:correct.*rate|accuracy|right.*rate|scoreRate|correctRate|accuracyRate|rightRate)|[\u6b63\u786e\u7387\u7b54\u5bf9\u7387]/i,
+    );
+    const responseCorrectCount = findResponseValue(
+      /(?:correct.*count|right.*count|correctNum|rightNum|rightCount)|(?:\u6b63\u786e.*\u9898\u6570|\u7b54\u5bf9.*\u9898)/i,
+    );
+    const responseTotalCount = findResponseValue(
+      /(?:total.*count|question.*count|allCount|totalNum|questionNum)|(?:\u603b\u9898\u6570|\u603b\u5171.*\u9898)/i,
+    );
+
+    const textScore = firstMatchValue(bodyText, [
+      /([0-9]+(?:\.[0-9]+)?)\s*\u5f97\u5206/,
+      /\u5f97\u5206\D{0,20}([0-9]+(?:\.[0-9]+)?)/,
+      /\u6210\u7ee9\D{0,20}([0-9]+(?:\.[0-9]+)?)/,
+      /\u5206\u6570\D{0,20}([0-9]+(?:\.[0-9]+)?)/,
+      /([0-9]+(?:\.[0-9]+)?)\s*\u5206(?!\s*\u949f)/,
+    ]);
+    const textAccuracy = firstMatchValue(bodyText, [
+      /\u6b63\u786e\u7387\D{0,20}([0-9]+(?:\.[0-9]+)?%?)/,
+      /\u7b54\u5bf9\u7387\D{0,20}([0-9]+(?:\.[0-9]+)?%?)/,
+    ]);
+    const textCorrectCount = firstMatchValue(bodyText, [
+      /\u7b54\u5bf9\s*([0-9]+)\s*\u9898/,
+      /\u505a\u5bf9\s*([0-9]+)\s*\u9898/,
+      /\u6b63\u786e\s*([0-9]+)\s*\u9898/,
+    ]);
+    const textTotalCount = firstMatchValue(bodyText, [
+      /\u5171\s*([0-9]+)\s*\u9898/,
+      /\u603b\u5171\s*([0-9]+)\s*\u9898/,
+      /\u603b\u9898\u6570\D{0,20}([0-9]+)/,
+    ]);
+
+    const fractionMatch = bodyText.match(/([0-9]+)\s*\/\s*([0-9]+)\s*(?:\u6b63\u786e\u9898\u6570|\u6b63\u786e|\u9898)/);
+    const cardRight = firstMatchValue(bodyText, [/\u7b54\u5bf9\s*[:\uff1a]?\s*([0-9]+)/]);
+    const cardWrong = firstMatchValue(bodyText, [/\u7b54\u9519\s*[:\uff1a]?\s*([0-9]+)/]);
+    const cardEmpty = firstMatchValue(bodyText, [/\u672a\u7b54\s*[:\uff1a]?\s*([0-9]+)/]);
+    const cardTotal = [cardRight, cardWrong, cardEmpty]
+      .map((item) => Number(item))
+      .reduce((sum, item) => (Number.isFinite(item) ? sum + item : sum), 0);
+
+    const score = formatScoreValue(textScore || responseScore);
+    const correctCount = formatScoreValue(fractionMatch?.[1] || cardRight || textCorrectCount || responseCorrectCount);
+    const totalCount = formatScoreValue(
+      fractionMatch?.[2] ||
+      (cardTotal > 0 ? cardTotal : '') ||
+      textTotalCount ||
+      responseTotalCount
+    );
+    let accuracy = '';
+
+    if (correctCount && totalCount) {
+      const correctNum = Number(correctCount);
+      const totalNum = Number(totalCount);
+      if (Number.isFinite(correctNum) && Number.isFinite(totalNum) && totalNum > 0) {
+        accuracy = formatPercentValue((correctNum / totalNum) * 100);
+      }
+    }
+    if (!accuracy) {
+      accuracy = formatPercentValue(textAccuracy || responseAccuracy);
+    }
+
+    const thresholdScore = getReportScoreForThreshold({ score, accuracy });
+    const textPassed = /\u5df2\u901a\u8fc7|\u901a\u8fc7|\u5408\u683c/.test(bodyText) &&
+      !/\u672a\u901a\u8fc7|\u4e0d\u5408\u683c/.test(bodyText);
+    const passed = Number.isFinite(thresholdScore)
+      ? thresholdScore >= Number(CFG.exam.minPassingScore || 80)
+      : textPassed;
+
+    return {
+      title: sheet.title || getExamPageTitle() || document.title || '',
+      paperNo: sheet.paperNo || 0,
+      topicId: String(context.topicId || ''),
+      periodId: String(context.periodId || ''),
+      score,
+      accuracy,
+      correctCount,
+      totalCount,
+      passed,
+      bodyText,
+    };
+  };
+
   const isExamReportPage = () => {
+    if (isExamReportPath()) return true;
+
     const bodyText = norm(document.body?.innerText || '');
     if (!bodyText) return false;
 
@@ -2813,7 +2990,7 @@
 
   const handleExamReportPage = async () => {
     const sessionKey = syncExamSessionState();
-    const summary = getExamReportSummary();
+    const summary = getExamReportSummaryV2();
     if (!summary) return false;
     if (!summary.score && !summary.accuracy && !summary.correctCount && !summary.totalCount) {
       log('exam report summary not ready yet');
@@ -2848,7 +3025,7 @@
     ].filter(Boolean);
 
     const thresholdScore = getReportScoreForThreshold(summary);
-    if (Number.isFinite(thresholdScore) && thresholdScore < Number(CFG.exam.minPassingScore || 80)) {
+    if (CFG.exam.stopOnLowScore && Number.isFinite(thresholdScore) && thresholdScore < Number(CFG.exam.minPassingScore || 80)) {
       const stopped = stopAutomation('exam-score-low', {
         score: thresholdScore,
         minPassingScore: CFG.exam.minPassingScore,
@@ -2858,6 +3035,7 @@
       log('exam score below threshold, automation stopped:', thresholdScore, stopped);
       void sendNotify('\u0045\u0052\u0052\u004f\u0052', '\u7b54\u6848\u6709\u8bef\uff0c\u5df2\u505c\u6b62\u811a\u672c', [
         ...lines,
+        `\u7ed3\u679c: \u672a\u901a\u8fc7`,
         `\u9608\u503c: ${CFG.exam.minPassingScore}`,
         `\u5f53\u524d\u9875: ${location.href}`,
       ], {
@@ -3801,6 +3979,7 @@
     const first = buttons[0];
     if (!first) return false;
 
+    setAfterExamReturnUrl();
     log('submit exam by ui:', getExamActionText(first));
     forceClickEl(first) || clickElOnce(first);
     await sleep(1200);
@@ -3819,6 +3998,7 @@
   };
 
   const submitExamPaper = async (payload) => {
+    setAfterExamReturnUrl();
     const auth = getUserAuthInfo();
     const headers = {
       Accept: 'application/json',
@@ -4354,6 +4534,7 @@
 
   const mainLoop = () => {
     rememberListUrl();
+    installStudyCenterReturnGuard();
     maybeRecoverNavigation();
 
     const onExamReportPage = isExamReportPage();
@@ -4364,6 +4545,15 @@
         log('automation stopped, skip main loop:', readJsonStorage(STORAGE.autoStopped, {}));
       }
       return;
+    }
+
+    if (isStudyCenterMyCourseUrl(location.href) && getStorage(STORAGE.afterExamReturnUrl) && !isAutomationStopped()) {
+      const target = getStorage(STORAGE.afterExamReturnUrl) || getCourseListUrl();
+      if (target && /\/study-course\//.test(target)) {
+        log('redirect study-center back to course detail:', target);
+        location.replace(target);
+        return;
+      }
     }
 
     if (!onExamReportPage && !onExamPage && (examSessionKey || examAutoStarted || examSubmitInProgress || examCompletedAt)) {
@@ -4378,6 +4568,7 @@
 
     if (onExamReportPage) {
       syncExamSessionState();
+      installExamApiHooks();
       if (allowNotify('exam-report-log', 30 * 1000)) {
         log('exam report page detected, automation enabled');
       }
@@ -4519,14 +4710,14 @@
         lastPaperData: liteValue(examRuntime.lastPaperData, 0),
         lastSubmitPayload: liteValue(examRuntime.lastSubmitPayload, 0),
         lastSubmitResponse: liteValue(examRuntime.lastSubmitResponse, 0),
-        reportSummary: liteValue(getExamReportSummary(), 0),
+        reportSummary: liteValue(getExamReportSummaryV2(), 0),
         sessionKey: examSessionKey,
         submitInProgress: examSubmitInProgress,
         autoStarted: examAutoStarted,
         completedAt: examCompletedAt,
       })),
       getExamAnswerSheet: () => runSafely('manual getExamAnswerSheet', getExamAnswerSheet),
-      getExamReportSummary: () => runSafely('manual getExamReportSummary', () => liteValue(getExamReportSummary(), 0)),
+      getExamReportSummary: () => runSafely('manual getExamReportSummary', () => liteValue(getExamReportSummaryV2(), 0)),
       getExamApiLog: () => runSafely('manual getExamApiLog', () => examRuntime.apiLog.slice()),
       getExamCurrentQuestionIndex: () => runSafely('manual getExamCurrentQuestionIndex', getExamCurrentQuestionIndex),
       getExamQuestionModel: () => runSafely('manual getExamQuestionModel', () => {
