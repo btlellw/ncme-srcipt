@@ -27,8 +27,10 @@
   let lastListPlayKey = '';
   let lastWindowOpenAt = 0;
   let lastWindowOpenUrl = '';
+  let lastActivePlayerHeartbeatAt = 0;
   let traceHooksInstalled = false;
   let traceEnabled = false;
+  const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const triedPendingUnits = new Set();
   const traceLog = [];
 
@@ -39,13 +41,16 @@
     notifyPrefix: 'ncme.auto.notify.',
     courseSnapshot: 'ncme.auto.courseSnapshot',
     listPlayLock: 'ncme.auto.listPlayLock',
+    activePlayer: 'ncme.auto.activePlayer',
   };
 
   const CFG = {
     scanIntervalMs: 3000,
     nextDelayMs: 2000,
     navigationTimeoutMs: 12000,
-    listPlayQuietAfterClickMs: 2 * 60 * 60 * 1000,
+    listPlayQuietAfterClickMs: 30 * 1000,
+    activePlayerStaleMs: 20 * 1000,
+    activePlayerHeartbeatMs: 5000,
     debug: true,
     autoExpandUnits: true,
     courseButtonText: /立即播放|继续学习|开始学习|去学习|去播放/,
@@ -363,6 +368,12 @@
     const shared = getSharedListPlayLock();
 
     if (shared?.until && current < Number(shared.until)) {
+      const sharedDuration = Number(shared.until) - Number(shared.createdAt || current);
+      if (sharedDuration > CFG.listPlayQuietAfterClickMs + 5000) {
+        removeStorage(STORAGE.listPlayLock);
+        return false;
+      }
+
       listPlayLockUntil = Math.max(listPlayLockUntil, Number(shared.until));
       lastListPlayKey = shared.key || lastListPlayKey;
       return true;
@@ -406,6 +417,45 @@
     }
     listPlayLockUntil = 0;
     lastListPlayKey = '';
+  };
+
+  const getActivePlayer = () => readJsonStorage(STORAGE.activePlayer, null);
+
+  const isActivePlayerFresh = () => {
+    const active = getActivePlayer();
+    if (!active?.updatedAt) return false;
+
+    const age = now() - Number(active.updatedAt);
+    if (age <= CFG.activePlayerStaleMs) return true;
+
+    removeStorage(STORAGE.activePlayer);
+    return false;
+  };
+
+  const markActivePlayer = (reason = 'heartbeat') => {
+    if (!/\/player\/record/.test(location.pathname)) return;
+    const current = now();
+    if (current - lastActivePlayerHeartbeatAt < CFG.activePlayerHeartbeatMs && reason === 'heartbeat') return;
+
+    lastActivePlayerHeartbeatAt = current;
+    setStorage(
+      STORAGE.activePlayer,
+      JSON.stringify({
+        tabId,
+        reason,
+        title: getCurrentLessonTitle() || '',
+        url: location.href,
+        updatedAt: current,
+      }),
+    );
+  };
+
+  const clearActivePlayer = (reason = 'clear') => {
+    const active = getActivePlayer();
+    if (!active || !active.tabId || active.tabId === tabId || reason === 'manual') {
+      removeStorage(STORAGE.activePlayer);
+      log('active player clear:', reason);
+    }
   };
 
   const buildNotifyMarkdown = (level, title, lines = []) => {
@@ -1498,6 +1548,7 @@
   const goToCourseList = (reason = 'unknown') => {
     const listUrl = getStorage(STORAGE.listUrl) || CFG.fallbackCourseListUrl;
     log('go to course list:', reason, listUrl || '(history back)');
+    clearActivePlayer(`return-list:${reason}`);
     beginNavigation(`list:${reason}`);
     setStorage(STORAGE.returningToList, '1');
     notifyUnitBoundary(reason);
@@ -1583,6 +1634,10 @@
   const tryStartCourseFromList = () => {
     if (navigationInProgress) return true;
     if (now() < listActionQuietUntil || isListPlayLocked()) return true;
+    if (isActivePlayerFresh()) {
+      log('active player detected, skip list automation');
+      return true;
+    }
 
     const returningToList = getStorage(STORAGE.returningToList) === '1';
     const lastLessonTitle = getStorage(STORAGE.lastLessonTitle) || '';
@@ -1798,6 +1853,7 @@
     if (!video || video.dataset.ncmeAutoBound === '1') return;
     video.dataset.ncmeAutoBound = '1';
     rememberCurrentLessonTitle();
+    markActivePlayer('bind-video');
     notifyLessonStart(video);
 
     const ensurePlaying = async () => {
@@ -1834,6 +1890,7 @@
     });
 
     video.addEventListener('timeupdate', () => {
+      markActivePlayer('heartbeat');
       if (!Number.isFinite(video.duration) || video.duration <= 0) return;
       if (video.currentTime > 0) {
         notifyLessonProgress(video);
@@ -1872,17 +1929,23 @@
 
     if (/\/player\/record/.test(location.pathname)) {
       rememberCurrentLessonTitle();
+      markActivePlayer('main-loop');
     }
 
     maybeHandleNextOverlay();
 
     const videos = findPlayableVideos();
     if (videos.length > 0) {
+      markActivePlayer('video-found');
       videos.forEach(bindVideo);
       return;
     }
 
     if (/study-course/.test(location.pathname)) {
+      if (isActivePlayerFresh()) {
+        log('active player detected, course list listener paused');
+        return;
+      }
       tryStartCourseFromList();
     }
   };
@@ -1916,6 +1979,7 @@
       resumeListAutomation: () => runSafely('manual resumeListAutomation', () => {
         listActionQuietUntil = 0;
         clearListPlayLock('manual-resume');
+        clearActivePlayer('manual');
         triedPendingUnits.clear();
         return true;
       }),
@@ -1929,6 +1993,15 @@
         key: lastListPlayKey,
         quietUntil: listActionQuietUntil,
         shared: getSharedListPlayLock(),
+      }),
+      getActivePlayer: () => ({
+        fresh: isActivePlayerFresh(),
+        active: getActivePlayer(),
+        tabId,
+      }),
+      clearActivePlayer: () => runSafely('manual clearActivePlayer', () => {
+        clearActivePlayer('manual');
+        return true;
       }),
       startTrace: () => runSafely('manual startTrace', () => {
         traceLog.length = 0;
