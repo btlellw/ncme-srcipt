@@ -81,7 +81,7 @@
     nextButtonText: /下一节|下一课|下一讲|下一个|继续学习|继续播放/,
     examMarkerText: /考试|测验|答题|提交试卷|交卷/,
     listStatusText: /未学习|学习中|未完成/,
-    courseItemTitleText: /^(单元\s*\d+|第?\d+\s*[讲课节章]).+/,
+    courseItemTitleText: /^(单元\s*\d+|课程\s*\d+|第?\d+\s*[讲课节章]).+/,
     skipAutoPlayItemText: /课程考核|考核|考试|测验|答题/,
     unitHeaderText: /(?:\(|（)必修(?:\)|）)/,
     unitPendingText: /未学习|学习中/,
@@ -1607,6 +1607,37 @@
       .sort((a, b) => a.button.getBoundingClientRect().top - b.button.getBoundingClientRect().top);
   };
 
+  const getEntryTop = (entry) => {
+    const target = entry?.detailRow || entry?.button || null;
+    if (!target) return Number.POSITIVE_INFINITY;
+    return target.getBoundingClientRect().top;
+  };
+
+  const getUnitBoundsForTop = (targetTop, unitItem = null, nextRowTop = Number.POSITIVE_INFINITY) => {
+    let top = unitItem?.getBoundingClientRect?.().top ?? Number.NEGATIVE_INFINITY;
+    let bottom = Number.isFinite(nextRowTop) ? nextRowTop : Number.POSITIVE_INFINITY;
+    const headers = getUnitHeaderElements()
+      .map((row) => ({ row, top: row.getBoundingClientRect().top }))
+      .sort((a, b) => a.top - b.top);
+    const prev = headers.filter((item) => item.top <= targetTop + 5).pop();
+    const next = headers.find((item) => item.top > targetTop + 5);
+    if (prev) top = prev.top;
+    if (next) bottom = next.top;
+    return { top, bottom };
+  };
+
+  const getPendingVideosBeforeExamEntry = (examEntry, unitItem = null, nextRowTop = Number.POSITIVE_INFINITY) => {
+    const examTop = getEntryTop(examEntry);
+    if (!Number.isFinite(examTop)) return [];
+    const bounds = getUnitBoundsForTop(examTop, unitItem, nextRowTop);
+    return getPendingPlayEntries(false)
+      .filter((entry) => {
+        const top = getEntryTop(entry);
+        return top > bounds.top + 5 && top < examTop - 5 && top < bounds.bottom - 5;
+      })
+      .sort((a, b) => getEntryTop(a) - getEntryTop(b));
+  };
+
   const getUnitHeaderLabel = (unitItem) => {
     if (!unitItem) return '';
     const lines = String(unitItem.textContent || '')
@@ -2028,8 +2059,14 @@
         examEntries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
       );
 
-      const videoEntry = entries.find((item) => isPendingLessonText(item.rowText)) || null;
       const examEntry = examEntries.find((item) => isPendingExamEntry(item)) || null;
+      const blockingVideoEntry = examEntry
+        ? getPendingVideosBeforeExamEntry(examEntry, unitItem, nextRowTop)[0] || null
+        : null;
+      if (blockingVideoEntry && !entries.includes(blockingVideoEntry)) {
+        log('exam blocked by pending video before exam:', blockingVideoEntry.title || blockingVideoEntry.rowText.slice(0, 120));
+      }
+      const videoEntry = entries.find((item) => isPendingLessonText(item.rowText)) || blockingVideoEntry || null;
       const entry = videoEntry || examEntry || null;
 
       if (!entry && attempt >= 1) {
@@ -4186,16 +4223,21 @@
   };
 
   const tryStartExamFromList = (snapshot, progressText, unitItem = null, nextRowTop = Number.POSITIVE_INFINITY) => {
-    const scopedVideos = unitItem ? getPlayEntriesForUnitScope(unitItem, nextRowTop) : [];
-    const pendingScopedVideo = scopedVideos.find((item) => isPendingLessonText(item.rowText));
-    if (pendingScopedVideo) {
-      return false;
-    }
-
     const entry = unitItem
       ? getExamEntriesForUnitScope(unitItem, nextRowTop).find((item) => isPendingExamEntry(item))
       : getPendingExamEntry();
     if (!entry) return false;
+
+    const scopedVideos = unitItem ? getPlayEntriesForUnitScope(unitItem, nextRowTop) : [];
+    const pendingScopedVideo =
+      scopedVideos.find((item) => isPendingLessonText(item.rowText)) ||
+      getPendingVideosBeforeExamEntry(entry, unitItem, nextRowTop)[0] ||
+      null;
+    if (pendingScopedVideo) {
+      log('skip exam because pending video exists before exam:', pendingScopedVideo.title || pendingScopedVideo.rowText.slice(0, 120));
+      return false;
+    }
+
     const plannedExam = getExamPlanEntryByTitle(entry.title) || getExamPlanEntryByTitle(entry.rowText);
 
     const lockKey = `list-exam:${hashText(entry.rowText || entry.title || norm(entry.button.textContent || ''))}`;
@@ -4253,7 +4295,7 @@
     const currentUnitIndex = headers.findIndex((row) => {
       const text = norm(row.textContent || '');
       const status = inferStudyStatus(text);
-      return status === '鏈涔?' || status === '瀛︿範涓?' || CFG.unitPendingText.test(text);
+      return status === '未学习' || status === '学习中' || CFG.unitPendingText.test(text);
     });
     const currentUnit = currentUnitIndex >= 0 ? headers[currentUnitIndex] : null;
     const currentUnitTop = currentUnit?.getBoundingClientRect().top ?? Number.NEGATIVE_INFINITY;
