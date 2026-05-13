@@ -38,6 +38,7 @@
   let traceHooksInstalled = false;
   let traceEnabled = false;
   let studyCenterGuardInstalled = false;
+  let learningOpenClickGuardInstalled = false;
   const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const triedPendingUnits = new Set();
   const traceLog = [];
@@ -77,6 +78,8 @@
     examReportReturnDelayMs: 2500,
     debug: true,
     autoExpandUnits: true,
+    reuseLearningPlayerTab: true,
+    notifyTimeZone: 'Asia/Shanghai',
     courseButtonText: /立即播放|继续学习|开始学习|去学习|去播放/,
     nextButtonText: /下一节|下一课|下一讲|下一个|继续学习|继续播放/,
     examMarkerText: /考试|测验|答题|提交试卷|交卷/,
@@ -136,13 +139,59 @@
 
   const PAGE_WINDOW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
+  const resolvePageUrl = (url) => {
+    try {
+      return new URL(String(url || ''), location.href);
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const shouldReuseLearningOpen = (url) => {
+    if (!CFG.reuseLearningPlayerTab || !isStudyCoursePage()) return false;
+    const parsed = resolvePageUrl(url);
+    return !!parsed && parsed.origin === location.origin && /\/player\/record/.test(parsed.pathname || '');
+  };
+
+  const navigateLearningOpenInCurrentTab = (url, source = 'window.open') => {
+    const parsed = resolvePageUrl(url);
+    if (!parsed) return false;
+    rememberListUrl();
+    clearActivePlayer(`reuse-current-tab:${source}`);
+    beginNavigation(`reuse-player:${source}`, parsed.href);
+    log('reuse current tab for player:', parsed.href);
+    location.assign(parsed.href);
+    return true;
+  };
+
+  const installLearningOpenClickGuard = () => {
+    if (learningOpenClickGuardInstalled) return;
+    learningOpenClickGuardInstalled = true;
+    document.addEventListener(
+      'click',
+      (event) => {
+        const anchor = event.target?.closest?.('a[href]');
+        if (!anchor || !shouldReuseLearningOpen(anchor.href)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        navigateLearningOpenInCurrentTab(anchor.href, 'anchor');
+      },
+      true,
+    );
+  };
+
   const installWindowOpenGuard = () => {
+    installLearningOpenClickGuard();
     const currentOpen = PAGE_WINDOW.open;
     if (typeof currentOpen !== 'function' || currentOpen.__ncmeAutoGuarded) return;
 
     const guardedOpen = function guardedOpen(url, target, features) {
       const normalizedUrl = String(url || '');
       const current = now();
+      if (shouldReuseLearningOpen(normalizedUrl) && navigateLearningOpenInCurrentTab(normalizedUrl, 'window.open')) {
+        return PAGE_WINDOW;
+      }
+
       if (normalizedUrl && normalizedUrl === lastWindowOpenUrl && current - lastWindowOpenAt < 5000) {
         log('duplicate window.open blocked:', normalizedUrl);
         return null;
@@ -266,7 +315,7 @@
 
   const parseLessonTitle = (title) => {
     const text = norm(title);
-    const match = text.match(/^(单元\s*\d+)[-—–:：]?\s*(.*)$/);
+    const match = text.match(/^(单元\s*\d+|课程\s*\d+|第?\d+\s*[讲课节章])[-—–:：]?\s*(.*)$/);
     return {
       raw: text,
       unitLabel: match ? norm(match[1]) : '',
@@ -499,7 +548,29 @@
     };
   };
 
+  const getProgressText = (snapshot) =>
+    snapshot && Number(snapshot.totalLessons) > 0
+      ? `${snapshot.completedLessons} / ${snapshot.totalLessons}`
+      : '未知';
+
   const escapeMd = (text) => String(text || '').replace(/([\\`*_{}\[\]()#+\-.!|>])/g, '\\$1');
+
+  const formatNotifyTime = (date = new Date()) => {
+    try {
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: CFG.notifyTimeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }).format(date).replace(/\//g, '-');
+    } catch (_) {
+      return date.toISOString();
+    }
+  };
 
   const isBenignPlayAbort = (err) => {
     const name = String(err?.name || '');
@@ -567,7 +638,7 @@
       'list play lock begin:',
       lastListPlayKey,
       title || '(no-title)',
-      new Date(listPlayLockUntil).toLocaleTimeString(),
+      formatNotifyTime(new Date(listPlayLockUntil)),
     );
   };
 
@@ -581,6 +652,44 @@
     }
     listPlayLockUntil = 0;
     lastListPlayKey = '';
+  };
+
+  const getListActionLockKey = (prefix, entry) =>
+    `${prefix}:${hashText(entry?.rowText || entry?.title || norm(entry?.button?.textContent || ''))}`;
+
+  const isSameListActionLocked = (lockKey) =>
+    isListPlayLocked() && lastListPlayKey === lockKey;
+
+  const beginLockedListAction = (lockKey, navigationReasonValue, entry) => {
+    beginListPlayLock(lockKey, entry?.title || '');
+    beginNavigation(navigationReasonValue, entry?.title || '');
+  };
+
+  const clickListEntryAction = (entry, options = {}) => {
+    const kind = options.kind || 'play';
+    const isExam = kind === 'exam';
+    const lockPrefix = isExam ? 'list-exam' : 'list-play';
+    const lockKey = getListActionLockKey(lockPrefix, entry);
+    if (isSameListActionLocked(lockKey)) return true;
+
+    log(isExam ? 'click exam button:' : 'click course button:', entry.title, entry.status, norm(entry.button?.textContent || ''));
+    beginLockedListAction(lockKey, `${lockPrefix}:${entry.status || 'pending'}`, entry);
+    if (isExam && options.expectedExamSource) {
+      setExpectedExamFromEntry(entry, options.expectedExamSource);
+    }
+
+    if (clickElOnce(entry.button)) {
+      void notifyListEntry(options.notifyTitle || (isExam ? '从课程目录进入试卷' : '从课程列表进入视频'), entry, options.snapshot, options.progressText, {
+        keyPrefix: options.keyPrefix || (isExam ? 'list-exam-click' : 'list-click'),
+      });
+      removeStorage(STORAGE.returningToList);
+      return true;
+    }
+
+    const failureReason = options.failureReason || (isExam ? 'exam-click-failed' : 'list-click-failed');
+    clearListPlayLock(failureReason);
+    resetNavigationState(failureReason);
+    return false;
   };
 
   const getActivePlayer = () => readJsonStorage(STORAGE.activePlayer, null);
@@ -879,7 +988,7 @@
       `## NCME \\| ${escapeMd(level)} \\| ${escapeMd(title)}`,
       ...safeLines,
       `> 页面: ${escapeMd(location.pathname)}`,
-      `> 时间: ${escapeMd(new Date().toLocaleString())}`,
+      `> 时间(${escapeMd(CFG.notifyTimeZone)}): ${escapeMd(formatNotifyTime())}`,
     ].join('\n');
   };
 
@@ -887,7 +996,7 @@
     `[NCME][${level}] ${title}`,
     ...lines.filter(Boolean),
     `页面: ${location.pathname}`,
-    `时间: ${new Date().toLocaleString()}`,
+    `时间(${CFG.notifyTimeZone}): ${formatNotifyTime()}`,
   ].join('\n');
 
   const postWebhook = (payload) => new Promise((resolve, reject) => {
@@ -969,6 +1078,31 @@
     });
   };
 
+  const notifyListEntry = (title, entry, snapshot, progressText, options = {}) => {
+    const parsed = parseLessonTitle(entry?.title || '');
+    return sendNotify('LIST', title, [
+      snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
+      parsed.unitLabel ? `单元: ${parsed.unitLabel}` : '',
+      parsed.lessonName ? `内容: ${parsed.lessonName}` : entry?.title ? `当前: ${entry.title}` : '',
+      `整体进度: ${progressText || '未知'}`,
+      entry?.status ? `状态: ${entry.status}` : '',
+      entry?.button ? `按钮: ${norm(entry.button.textContent || '')}` : '',
+    ], {
+      intervalMs: options.intervalMs ?? 5000,
+      key: `${options.keyPrefix || 'list-entry'}:${hashText(entry?.rowText || entry?.title || norm(entry?.button?.textContent || ''))}`,
+    });
+  };
+
+  const notifyListStatus = (title, snapshot, progressText, lines = [], options = {}) =>
+    sendNotify('LIST', title, [
+      snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
+      `整体进度: ${progressText || '未知'}`,
+      ...lines,
+    ], {
+      intervalMs: options.intervalMs ?? 5000,
+      key: options.key || `${title}:${hashText(lines.join('|'))}`,
+    });
+
   const isVisible = (el) => {
     if (!el) return false;
     const style = window.getComputedStyle(el);
@@ -1045,6 +1179,67 @@
     return textFallback;
   };
 
+  const getDetailRowEntries = (root = document) =>
+    Array.from(root.querySelectorAll('.courseStudyInfoDetail'));
+
+  const sortEntriesByTop = (entries) =>
+    entries.sort((a, b) =>
+      (a.detailRow || a.button).getBoundingClientRect().top -
+      (b.detailRow || b.button).getBoundingClientRect().top
+    );
+
+  const getPlayEntryFromDetailRow = (detailRow) => {
+    const rowText = norm(detailRow?.textContent || '');
+    const button = detailRow?.querySelector?.('.playbtn') || null;
+    const title = extractLessonTitleFromText(rowText);
+    const unitItem = detailRow?.closest?.('.courseStudyItem') || button?.closest?.('.courseStudyItem') || null;
+    const unitText = norm(unitItem?.textContent || '');
+    return {
+      button,
+      detailRow,
+      rowText,
+      title,
+      status: inferStudyStatus(rowText),
+      buttonVisible: !!button && isVisible(button),
+      rowVisible: !!detailRow && isVisible(detailRow),
+      unitItem,
+      unitText,
+      unitStatus: inferStudyStatus(unitText),
+    };
+  };
+
+  const isPlayableEntry = (entry, { includeHidden = false, requirePending = false } = {}) =>
+    !!entry?.button &&
+    (includeHidden || isVisible(entry.button)) &&
+    !isDisabled(entry.button) &&
+    (!requirePending || isPendingLessonText(entry.rowText)) &&
+    !CFG.skipAutoPlayItemText.test(entry.rowText || '');
+
+  const getExamActionButton = (detailRow) =>
+    Array.from(detailRow?.querySelectorAll?.('.playbtn,button,a,[role="button"],.el-button,span,div') || [])
+      .find((candidate) =>
+        isVisible(candidate) &&
+        !isDisabled(candidate) &&
+        isExamActionText(candidate.textContent || candidate.value || '')
+      ) || null;
+
+  const getExamEntryFromDetailRow = (detailRow) => {
+    const rowText = norm(detailRow?.textContent || '');
+    return {
+      button: getExamActionButton(detailRow),
+      detailRow,
+      rowText,
+      title: extractExamTitleFromText(rowText) || extractLessonTitleFromText(rowText) || rowText.split(' ').slice(0, 6).join(' '),
+      status: inferExamProgress(rowText),
+    };
+  };
+
+  const isExamEntryVisible = (entry) =>
+    !!entry?.button &&
+    isVisible(entry.button) &&
+    !isDisabled(entry.button) &&
+    /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(entry.rowText || '');
+
   const getCourseListPlayEntries = () => {
     if (!isStudyCoursePage()) return [];
 
@@ -1055,19 +1250,14 @@
       })
       .map((button) => {
         const detailRow = getCandidateRow(button);
-        const rowText = norm(detailRow?.textContent || '');
-        const title = extractLessonTitleFromText(rowText);
         const unitItem = button.closest('.courseStudyItem');
         const unitText = norm(unitItem?.textContent || '');
         return {
-          button,
-          detailRow,
-          rowText,
-          title,
-          status: inferStudyStatus(rowText),
+          ...getPlayEntryFromDetailRow(detailRow),
           unitItem,
           unitText,
           unitStatus: inferStudyStatus(unitText),
+          button,
         };
       })
       .filter((entry) => entry.title);
@@ -1079,30 +1269,11 @@
   };
 
   const getPendingPlayEntries = (includeHidden = false) =>
-    Array.from(document.querySelectorAll('.courseStudyInfoDetail'))
-      .map((detailRow) => {
-        const rowText = norm(detailRow.textContent || '');
-        const button = detailRow.querySelector('.playbtn');
-        const title = extractLessonTitleFromText(rowText);
-        return {
-          button,
-          detailRow,
-          rowText,
-          title,
-          status: inferStudyStatus(rowText),
-          buttonVisible: !!button && isVisible(button),
-          rowVisible: isVisible(detailRow),
-          unitText: norm(detailRow.closest('.courseStudyItem')?.textContent || '').slice(0, 180),
-        };
-      })
-      .filter((entry) =>
-        entry.button &&
-        (includeHidden || entry.buttonVisible) &&
-        !isDisabled(entry.button) &&
-        isPendingLessonText(entry.rowText) &&
-        !CFG.skipAutoPlayItemText.test(entry.rowText)
-      )
-      .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
+    sortEntriesByTop(
+      getDetailRowEntries()
+        .map(getPlayEntryFromDetailRow)
+        .filter((entry) => isPlayableEntry(entry, { includeHidden, requirePending: true }))
+    );
 
   const isExamActionText = (text) => /^(?:\u53bb\u505a\u9898|\u53bb\u7b54\u9898|\u53bb\u8003\u8bd5|\u5f00\u59cb\u8003\u8bd5|\u5f00\u59cb\u7b54\u9898|\u7ee7\u7eed\u8003\u8bd5|\u7ee7\u7eed\u7b54\u9898|\u7acb\u5373\u7b54\u9898|\u7acb\u5373\u8003\u8bd5)$/.test(compact(text || ''));
 
@@ -1131,31 +1302,11 @@
   const getCourseListExamEntries = () => {
     if (!isStudyCoursePage()) return [];
 
-    return Array.from(document.querySelectorAll('.courseStudyInfoDetail'))
-      .map((detailRow) => {
-        const rowText = norm(detailRow.textContent || '');
-        const actionCandidates = Array.from(
-          detailRow.querySelectorAll('.playbtn,button,a,[role="button"],.el-button,span,div')
-        );
-        const button = actionCandidates.find((candidate) =>
-          isVisible(candidate) &&
-          !isDisabled(candidate) &&
-          isExamActionText(candidate.textContent || candidate.value || '')
-        ) || null;
-
-        return {
-          button,
-          detailRow,
-          rowText,
-          title: extractExamTitleFromText(rowText) || extractLessonTitleFromText(rowText) || rowText.split(' ').slice(0, 6).join(' '),
-          status: inferExamProgress(rowText),
-        };
-      })
-      .filter((entry) =>
-        entry.button &&
-        /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(entry.rowText)
-      )
-      .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
+    return sortEntriesByTop(
+      getDetailRowEntries()
+        .map(getExamEntryFromDetailRow)
+        .filter((entry) => entry.button && /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(entry.rowText))
+    );
   };
 
   const getPendingExamEntry = () =>
@@ -1167,33 +1318,11 @@
   const getExamEntriesForUnitItem = (unitItem) => {
     if (!unitItem) return [];
 
-    return Array.from(unitItem.querySelectorAll('.courseStudyInfoDetail'))
-      .map((detailRow) => {
-        const rowText = norm(detailRow.textContent || '');
-        const actionCandidates = Array.from(
-          detailRow.querySelectorAll('.playbtn,button,a,[role="button"],.el-button,span,div')
-        );
-        const button = actionCandidates.find((candidate) =>
-          isVisible(candidate) &&
-          !isDisabled(candidate) &&
-          isExamActionText(candidate.textContent || candidate.value || '')
-        ) || null;
-
-        return {
-          detailRow,
-          rowText,
-          button,
-          title: extractExamTitleFromText(rowText) || extractLessonTitleFromText(rowText) || rowText.split(' ').slice(0, 6).join(' '),
-          status: inferExamProgress(rowText),
-        };
-      })
-      .filter((entry) =>
-        entry.button &&
-        isVisible(entry.button) &&
-        !isDisabled(entry.button) &&
-        /(?:\u8bfe\u7a0b\u8003\u6838|\u8003\u6838|\u8bd5\u5377|\u8003\u8bd5|\u6d4b\u9a8c|\u7b54\u9898)/.test(entry.rowText)
-      )
-      .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
+    return sortEntriesByTop(
+      getDetailRowEntries(unitItem)
+        .map(getExamEntryFromDetailRow)
+        .filter(isExamEntryVisible)
+    );
   };
 
   const getExamEntriesForUnitScope = (unitItem, nextRowTop = Number.POSITIVE_INFINITY) => {
@@ -1563,27 +1692,11 @@
   const getPlayEntriesForUnitItem = (unitItem) => {
     if (!unitItem) return [];
 
-    return Array.from(unitItem.querySelectorAll('.courseStudyInfoDetail'))
-      .map((detailRow) => {
-        const rowText = norm(detailRow.textContent || '');
-        const button = detailRow.querySelector('.playbtn');
-        const title = extractLessonTitleFromText(rowText);
-        return {
-          detailRow,
-          rowText,
-          button,
-          title,
-          status: inferStudyStatus(rowText),
-        };
-      })
-      .filter((entry) =>
-        entry.button &&
-        isVisible(entry.button) &&
-        !isDisabled(entry.button) &&
-        entry.title &&
-        !CFG.skipAutoPlayItemText.test(entry.rowText)
-      )
-      .sort((a, b) => a.detailRow.getBoundingClientRect().top - b.detailRow.getBoundingClientRect().top);
+    return sortEntriesByTop(
+      getDetailRowEntries(unitItem)
+        .map(getPlayEntryFromDetailRow)
+        .filter((entry) => entry.title && isPlayableEntry(entry))
+    );
   };
 
   const getPlayEntriesForUnitScope = (unitItem, nextRowTop = Number.POSITIVE_INFINITY) => {
@@ -1647,12 +1760,29 @@
     return lines.find((line) => CFG.unitHeaderText.test(line)) || norm(unitItem.textContent || '').slice(0, 120);
   };
 
+  const isPendingUnitRow = (row) => {
+    const text = norm(row?.textContent || '');
+    const status = inferStudyStatus(text);
+    return status === '未学习' || status === '学习中' || CFG.unitPendingText.test(text);
+  };
+
   const getPendingUnitElement = () =>
-    getUnitHeaderElements().find((row) => {
-      const text = norm(row.textContent || '');
-      const status = inferStudyStatus(text);
-      return status === '未学习' || status === '学习中' || CFG.unitPendingText.test(text);
-    }) || null;
+    getUnitHeaderElements().find(isPendingUnitRow) || null;
+
+  const getCurrentPendingUnitScope = () => {
+    const headers = getUnitHeaderElements();
+    const index = headers.findIndex(isPendingUnitRow);
+    const unit = index >= 0 ? headers[index] : null;
+    return {
+      headers,
+      index,
+      unit,
+      top: unit?.getBoundingClientRect().top ?? Number.NEGATIVE_INFINITY,
+      nextTop: index >= 0
+        ? headers[index + 1]?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY
+        : Number.POSITIVE_INFINITY,
+    };
+  };
 
   const summarizeVue = (vm) => {
     if (!vm) return null;
@@ -1815,6 +1945,17 @@
     }
 
     return null;
+  };
+
+  const setExpectedExamFromEntry = (entry, source) => {
+    const plannedExam = getExamPlanEntryByTitle(entry?.title) || getExamPlanEntryByTitle(entry?.rowText);
+    if (!plannedExam?.paperNo) return null;
+    setExpectedExam(plannedExam.paperNo, {
+      title: plannedExam.title || entry?.title || '',
+      source,
+    });
+    log('expected exam paper set:', plannedExam.paperNo, plannedExam.title || entry?.title || '');
+    return plannedExam;
   };
 
   const collectExamPlanFromCourseStudy = () => {
@@ -2019,6 +2160,57 @@
     return true;
   };
 
+  const resolveUnitScopedAction = (unitItem, nextRowTop) => {
+    const entries = getPlayEntriesForUnitScope(unitItem, nextRowTop);
+    const examEntries = getExamEntriesForUnitScope(unitItem, nextRowTop);
+    const examEntry = examEntries.find((item) => isPendingExamEntry(item)) || null;
+    const blockingVideoEntry = examEntry
+      ? getPendingVideosBeforeExamEntry(examEntry, unitItem, nextRowTop)[0] || null
+      : null;
+    const videoEntry = entries.find((item) => isPendingLessonText(item.rowText)) || blockingVideoEntry || null;
+
+    return {
+      entries,
+      examEntries,
+      examEntry,
+      blockingVideoEntry,
+      videoEntry,
+      entry: videoEntry || examEntry || null,
+      isExamEntry: !!examEntry && !videoEntry,
+    };
+  };
+
+  const logUnitScopedAction = (action) => {
+    log(
+      'unit play entries:',
+      action.entries.length,
+      action.entries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
+    );
+    log(
+      'unit exam entries:',
+      action.examEntries.length,
+      action.examEntries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
+    );
+    if (action.blockingVideoEntry && !action.entries.includes(action.blockingVideoEntry)) {
+      log('exam blocked by pending video before exam:', action.blockingVideoEntry.title || action.blockingVideoEntry.rowText.slice(0, 120));
+    }
+  };
+
+  const clickUnitScopedEntry = (entry, isExamEntry, snapshot, progressText) => {
+    log(isExamEntry ? 'click unit exam button:' : 'click unit course button:', entry.title, entry.status, norm(entry.button?.textContent || ''));
+    if (isExamEntry) {
+      setExpectedExamFromEntry(entry, 'unit-schedule');
+    }
+    if (!clickElOnce(entry.button)) return false;
+
+    beginNavigation(isExamEntry ? `list-exam:${entry.status}` : `list-play:${entry.status}`, entry.title);
+    void notifyListEntry(isExamEntry ? '展开后进入试卷' : '展开后进入视频', entry, snapshot, progressText, {
+      keyPrefix: isExamEntry ? 'unit-exam' : 'unit-play',
+    });
+    removeStorage(STORAGE.returningToList);
+    return true;
+  };
+
   const scheduleUnitPlaybackStart = (unitItem, nextRowTop, snapshot, progressText) => {
     if (!unitItem || unitStartSequenceInProgress) {
       return false;
@@ -2045,68 +2237,22 @@
         return;
       }
 
-      const entries = getPlayEntriesForUnitScope(unitItem, nextRowTop);
-      const examEntries = getExamEntriesForUnitScope(unitItem, nextRowTop);
-      log(
-        'unit play entries:',
-        entries.length,
-        entries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
-      );
-
-      log(
-        'unit exam entries:',
-        examEntries.length,
-        examEntries.map((entry) => `${entry.status}:${entry.title}`).join(' | ').slice(0, 320)
-      );
-
-      const examEntry = examEntries.find((item) => isPendingExamEntry(item)) || null;
-      const blockingVideoEntry = examEntry
-        ? getPendingVideosBeforeExamEntry(examEntry, unitItem, nextRowTop)[0] || null
-        : null;
-      if (blockingVideoEntry && !entries.includes(blockingVideoEntry)) {
-        log('exam blocked by pending video before exam:', blockingVideoEntry.title || blockingVideoEntry.rowText.slice(0, 120));
-      }
-      const videoEntry = entries.find((item) => isPendingLessonText(item.rowText)) || blockingVideoEntry || null;
-      const entry = videoEntry || examEntry || null;
+      const action = resolveUnitScopedAction(unitItem, nextRowTop);
+      logUnitScopedAction(action);
+      const { entry, isExamEntry } = action;
 
       if (!entry && attempt >= 1) {
         log(
           'no scoped pending unit action, stop probing:',
-          entries.map((item) => `${item.status}:${item.title}`).join(' | ').slice(0, 240),
+          action.entries.map((item) => `${item.status}:${item.title}`).join(' | ').slice(0, 240),
           'exam=',
-          examEntries.map((item) => `${item.status}:${item.title}`).join(' | ').slice(0, 240)
+          action.examEntries.map((item) => `${item.status}:${item.title}`).join(' | ').slice(0, 240)
         );
         finish('no-pending-entry');
         return;
       }
       if (entry) {
-        const isExamEntry = !!examEntry && entry === examEntry && !videoEntry;
-        log(isExamEntry ? 'click unit exam button:' : 'click unit course button:', entry.title, entry.status, norm(entry.button.textContent));
-        if (isExamEntry) {
-          const plannedExam = getExamPlanEntryByTitle(entry.title) || getExamPlanEntryByTitle(entry.rowText);
-          if (plannedExam?.paperNo) {
-            setExpectedExam(plannedExam.paperNo, {
-              title: plannedExam.title || entry.title || '',
-              source: 'unit-schedule',
-            });
-            log('expected exam paper set:', plannedExam.paperNo, plannedExam.title || entry.title || '');
-          }
-        }
-        if (clickElOnce(entry.button)) {
-          const parsed = parseLessonTitle(entry.title);
-          beginNavigation(isExamEntry ? `list-exam:${entry.status}` : `list-play:${entry.status}`, entry.title);
-          void sendNotify('LIST', '展开后进入视频', [
-            snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
-            parsed.unitLabel ? `单元: ${parsed.unitLabel}` : '',
-            parsed.lessonName ? `内容: ${parsed.lessonName}` : entry.title ? `当前: ${entry.title}` : '',
-            `整体进度: ${progressText}`,
-            `状态: ${entry.status}`,
-            `按钮: ${norm(entry.button.textContent)}`,
-          ], {
-            intervalMs: 5000,
-            key: `unit-play:${hashText(entry.rowText || entry.title)}`,
-          });
-          removeStorage(STORAGE.returningToList);
+        if (clickUnitScopedEntry(entry, isExamEntry, snapshot, progressText)) {
           finish('clicked');
           return;
         }
@@ -2171,12 +2317,9 @@
       markExpandAttempt(expandKey);
       triedPendingUnits.add(expandKey);
       if (clickUnitExpand(row, target, nextRowTop)) {
-        void sendNotify('LIST', '展开下一个未学习单元', [
-          snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
-          `整体进度: ${progressText}`,
+        void notifyListStatus('展开下一个未学习单元', snapshot, progressText, [
           `单元: ${rowText.slice(0, 160)}`,
         ], {
-          intervalMs: 5000,
           key: `expand-unit:${hashText(rowText)}`,
         });
         scheduleUnitPlaybackStart(row, nextRowTop, snapshot, progressText);
@@ -4222,58 +4365,65 @@
     return true;
   };
 
-  const tryStartExamFromList = (snapshot, progressText, unitItem = null, nextRowTop = Number.POSITIVE_INFINITY) => {
-    const entry = unitItem
-      ? getExamEntriesForUnitScope(unitItem, nextRowTop).find((item) => isPendingExamEntry(item))
+  const getPlayableEntriesForCurrentScope = (scope, returningToList, lastLessonTitle) =>
+    getCourseListPlayEntries()
+      .filter((entry) => {
+        if (CFG.skipAutoPlayItemText.test(entry.rowText)) return false;
+        if (entry.status === '已完成') return false;
+        if (returningToList && lastLessonTitle && entry.rowText.includes(lastLessonTitle)) return false;
+        if (!isPendingLessonText(entry.rowText)) return false;
+        if (!scope.unit) return true;
+        const rect = entry.button.getBoundingClientRect();
+        return rect.top > scope.top + 10 && rect.top < scope.nextTop - 10;
+      })
+      .sort((a, b) => a.button.getBoundingClientRect().top - b.button.getBoundingClientRect().top);
+
+  const resolveCourseListAction = (context) => {
+    const { scope, snapshot, progressText, returningToList, lastLessonTitle } = context;
+
+    const examEntry = scope.unit
+      ? getExamEntriesForUnitScope(scope.unit, scope.nextTop).find((item) => isPendingExamEntry(item))
       : getPendingExamEntry();
-    if (!entry) return false;
-
-    const scopedVideos = unitItem ? getPlayEntriesForUnitScope(unitItem, nextRowTop) : [];
-    const pendingScopedVideo =
-      scopedVideos.find((item) => isPendingLessonText(item.rowText)) ||
-      getPendingVideosBeforeExamEntry(entry, unitItem, nextRowTop)[0] ||
-      null;
-    if (pendingScopedVideo) {
-      log('skip exam because pending video exists before exam:', pendingScopedVideo.title || pendingScopedVideo.rowText.slice(0, 120));
-      return false;
+    if (examEntry) {
+      const pendingVideoBeforeExam =
+        (scope.unit ? getPlayEntriesForUnitScope(scope.unit, scope.nextTop) : []).find((item) => isPendingLessonText(item.rowText)) ||
+        getPendingVideosBeforeExamEntry(examEntry, scope.unit, scope.nextTop)[0] ||
+        null;
+      if (!pendingVideoBeforeExam) {
+        return {
+          type: 'exam',
+          entry: examEntry,
+          execute: () => clickListEntryAction(examEntry, {
+            kind: 'exam',
+            snapshot,
+            progressText,
+            notifyTitle: '从课程目录进入试卷',
+            keyPrefix: 'list-exam-click',
+            expectedExamSource: 'list-exam-click',
+            failureReason: 'exam-click-failed',
+          }),
+        };
+      }
+      log('skip exam because pending video exists before exam:', pendingVideoBeforeExam.title || pendingVideoBeforeExam.rowText.slice(0, 120));
     }
 
-    const plannedExam = getExamPlanEntryByTitle(entry.title) || getExamPlanEntryByTitle(entry.rowText);
-
-    const lockKey = `list-exam:${hashText(entry.rowText || entry.title || norm(entry.button.textContent || ''))}`;
-    if (isListPlayLocked() && lastListPlayKey === lockKey) {
-      return true;
+    const playEntry = getPlayableEntriesForCurrentScope(scope, returningToList, lastLessonTitle)[0] || null;
+    if (playEntry) {
+      return {
+        type: 'play',
+        entry: playEntry,
+        execute: () => clickListEntryAction(playEntry, {
+          kind: 'play',
+          snapshot,
+          progressText,
+          notifyTitle: '从课程列表进入视频',
+          keyPrefix: 'list-click',
+          failureReason: 'list-click-failed',
+        }),
+      };
     }
 
-    log('click exam button:', entry.title, entry.status, norm(entry.button.textContent || ''));
-    beginListPlayLock(lockKey, entry.title);
-    beginNavigation(`list-exam:${entry.status || 'pending'}`, entry.title);
-    if (plannedExam?.paperNo) {
-      setExpectedExam(plannedExam.paperNo, {
-        title: plannedExam.title || entry.title || '',
-        source: 'list-exam-click',
-      });
-      log('expected exam paper set:', plannedExam.paperNo, plannedExam.title || entry.title || '');
-    }
-
-    if (clickElOnce(entry.button)) {
-      void sendNotify('LIST', '\u4ece\u8bfe\u7a0b\u76ee\u5f55\u8fdb\u5165\u8bd5\u5377', [
-        snapshot?.courseTitle ? `\u8bfe\u7a0b: ${snapshot.courseTitle}` : '',
-        entry.title ? `\u5185\u5bb9: ${entry.title}` : '',
-        entry.status ? `\u72b6\u6001: ${entry.status}` : '',
-        `\u6574\u4f53\u8fdb\u5ea6: ${progressText}`,
-        `\u6309\u94ae: ${norm(entry.button.textContent || '')}`,
-      ], {
-        intervalMs: 5000,
-        key: `list-exam-click:${hashText(entry.rowText || entry.title)}`,
-      });
-      removeStorage(STORAGE.returningToList);
-      return true;
-    }
-
-    clearListPlayLock('exam-click-failed');
-    resetNavigationState('exam-click-failed');
-    return false;
+    return null;
   };
 
   const tryStartCourseFromList = () => {
@@ -4287,81 +4437,22 @@
     const returningToList = getStorage(STORAGE.returningToList) === '1';
     const lastLessonTitle = getStorage(STORAGE.lastLessonTitle) || '';
     const snapshot = collectCourseSnapshot() || getCourseSnapshot();
-    const progressText =
-      snapshot && snapshot.totalLessons > 0
-        ? `${snapshot.completedLessons} / ${snapshot.totalLessons}`
-        : '未知';
-    const headers = getUnitHeaderElements();
-    const currentUnitIndex = headers.findIndex((row) => {
-      const text = norm(row.textContent || '');
-      const status = inferStudyStatus(text);
-      return status === '未学习' || status === '学习中' || CFG.unitPendingText.test(text);
+    const progressText = getProgressText(snapshot);
+    const currentScope = getCurrentPendingUnitScope();
+    const action = resolveCourseListAction({
+      scope: currentScope,
+      snapshot,
+      progressText,
+      returningToList,
+      lastLessonTitle,
     });
-    const currentUnit = currentUnitIndex >= 0 ? headers[currentUnitIndex] : null;
-    const currentUnitTop = currentUnit?.getBoundingClientRect().top ?? Number.NEGATIVE_INFINITY;
-    const currentNextRowTop = currentUnitIndex >= 0
-      ? headers[currentUnitIndex + 1]?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY
-      : Number.POSITIVE_INFINITY;
-
-    if (tryStartExamFromList(snapshot, progressText, currentUnit, currentNextRowTop)) {
-      return true;
-    }
-
-    const entries = getCourseListPlayEntries()
-      .filter((entry) => {
-        if (!currentUnit) return true;
-        const rect = entry.button.getBoundingClientRect();
-        return rect.top > currentUnitTop + 10 && rect.top < currentNextRowTop - 10;
-      })
-      .sort((a, b) => a.button.getBoundingClientRect().top - b.button.getBoundingClientRect().top);
-
-    for (const entry of entries) {
-      if (CFG.skipAutoPlayItemText.test(entry.rowText)) {
-        continue;
-      }
-      if (entry.status === '已完成') {
-        continue;
-      }
-      if (returningToList && lastLessonTitle && entry.rowText.includes(lastLessonTitle)) {
-        continue;
-      }
-      if (entry.status === '未学习' || entry.status === '学习中') {
-        const lockKey = `list-play:${hashText(entry.rowText || entry.title || norm(entry.button.textContent))}`;
-        if (isListPlayLocked() && lastListPlayKey === lockKey) return true;
-
-        log('click course button:', entry.title, entry.status, norm(entry.button.textContent));
-        beginListPlayLock(lockKey, entry.title);
-        beginNavigation(`list-play:${entry.status}`, entry.title);
-        if (clickElOnce(entry.button)) {
-          const parsed = parseLessonTitle(entry.title);
-          void sendNotify('LIST', '从课程列表进入视频', [
-            snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
-            parsed.unitLabel ? `单元: ${parsed.unitLabel}` : '',
-            parsed.lessonName ? `内容: ${parsed.lessonName}` : entry.title ? `当前: ${entry.title}` : '',
-            `整体进度: ${progressText}`,
-            `状态: ${entry.status}`,
-            `按钮: ${norm(entry.button.textContent)}`,
-          ], {
-            intervalMs: 5000,
-            key: `list-click:${hashText(entry.rowText || norm(entry.button.textContent))}`,
-          });
-          removeStorage(STORAGE.returningToList);
-          return true;
-        }
-
-        clearListPlayLock('click-failed');
-        resetNavigationState('list-click-failed');
-      }
-    }
+    if (action) return action.execute();
 
     if (CFG.autoExpandUnits && expandPendingUnitByVue()) {
       listActionQuietUntil = now() + 3000;
-      void sendNotify('LIST', '展开下一个未学习单元', [
-        snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
-        `整体进度: ${progressText}`,
+      void notifyListStatus('展开下一个未学习单元', snapshot, progressText, [
         '方式: Vue 数据 isShow',
       ], {
-        intervalMs: 5000,
         key: 'vue-expand-pending-unit',
       });
       return true;
@@ -4370,9 +4461,7 @@
     if (!CFG.autoExpandUnits) {
       log('no visible pending play entry; waiting for unit expansion');
       listActionQuietUntil = now() + 30 * 1000;
-      void sendNotify('LIST', '等待展开未学习单元', [
-        snapshot?.courseTitle ? `课程: ${snapshot.courseTitle}` : '',
-        `整体进度: ${progressText}`,
+      void notifyListStatus('等待展开未学习单元', snapshot, progressText, [
         '说明: 未发现可见的未学习播放按钮，已停止猜测点击。',
       ], {
         intervalMs: 60 * 1000,
@@ -4382,8 +4471,6 @@
     }
 
     return tryExpandNextPendingUnit(snapshot, progressText);
-
-    return false;
   };
 
   const tryClickNext = async (source = 'unknown') => {
@@ -4910,11 +4997,7 @@
       tryStartCourseFromList: () => runSafely('manual tryStartCourseFromList', tryStartCourseFromList),
       tryExpandNextPendingUnit: () => runSafely('manual tryExpandNextPendingUnit', () => {
         const snapshot = collectCourseSnapshot() || getCourseSnapshot();
-        const progressText =
-          snapshot && snapshot.totalLessons > 0
-            ? `${snapshot.completedLessons} / ${snapshot.totalLessons}`
-            : '未知';
-        return tryExpandNextPendingUnit(snapshot, progressText);
+        return tryExpandNextPendingUnit(snapshot, getProgressText(snapshot));
       }),
       getCourseListPlayEntries: () => runSafely('manual getCourseListPlayEntries', getCourseListPlayEntries),
       getCourseListExamEntries: () => runSafely('manual getCourseListExamEntries', () => liteValue(
@@ -4930,19 +5013,14 @@
       getCourseSnapshot: () => runSafely('manual getCourseSnapshot', () => collectCourseSnapshot() || getCourseSnapshot()),
       getUnitItems: () => runSafely('manual getUnitItems', getUnitItemsDebug),
       getPlayEntriesForUnitItem: () => runSafely('manual getPlayEntriesForUnitItem', () => {
-        const unit = getUnitHeaderElements().find((row) => inferStudyStatus(norm(row.textContent || '')) === '未学习');
-        return getPlayEntriesForUnitItem(unit);
+        return getPlayEntriesForUnitItem(getPendingUnitElement());
       }),
       getPlayEntriesForPendingUnitScope: () => runSafely('manual getPlayEntriesForPendingUnitScope', () => {
-        const headers = getUnitHeaderElements();
-        const index = headers.findIndex((row) => inferStudyStatus(norm(row.textContent || '')) === '未学习');
-        if (index < 0) return [];
-        const unit = headers[index];
-        const nextRowTop = headers[index + 1]?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY;
-        return getPlayEntriesForUnitScope(unit, nextRowTop);
+        const scope = getCurrentPendingUnitScope();
+        return scope.unit ? getPlayEntriesForUnitScope(scope.unit, scope.nextTop) : [];
       }),
       clickPendingUnitHeader: () => runSafely('manual clickPendingUnitHeader', () => {
-        const unit = getUnitHeaderElements().find((row) => inferStudyStatus(norm(row.textContent || '')) === '未学习');
+        const unit = getPendingUnitElement();
         if (!unit) return null;
         const target = getUnitHeaderClickTarget(unit) || unit;
         forceClickEl(target) || forceClickEl(unit);
@@ -4953,7 +5031,7 @@
       }),
       clickFirstPlaybtn: () => runSafely('manual clickFirstPlaybtn', () => {
         const entries = getCourseListPlayEntries();
-        const entry = entries.find((item) => item.status === '未学习' || item.status === '学习中');
+        const entry = entries.find((item) => isPendingLessonText(item.rowText));
         if (!entry) return null;
         clickElOnce(entry.button);
         return {
@@ -4964,11 +5042,7 @@
       }),
       clickNextPendingUnit: () => runSafely('manual clickNextPendingUnit', () => {
         const snapshot = collectCourseSnapshot() || getCourseSnapshot();
-        const progressText =
-          snapshot && snapshot.totalLessons > 0
-            ? `${snapshot.completedLessons} / ${snapshot.totalLessons}`
-            : '未知';
-        return tryExpandNextPendingUnit(snapshot, progressText);
+        return tryExpandNextPendingUnit(snapshot, getProgressText(snapshot));
       }),
     };
     log('debug hook exposed on page window');
