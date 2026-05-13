@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "updatedAt": 0,
+  "items": {
+    "code:28830957": {
+      "answer": "A",
+      "source": "verified:draft",
+      "verified": true,
+      "question": "示例题目",
+      "options": [
+        {
+          "letter": "A",
+          "text": "选项A"
+        },
+        {
+          "letter": "B",
+          "text": "选项B"
+        }
+      ],
+      "code": "28830957",
+      "topicId": "76474",
+      "paperId": "28502224",
+      "updatedAt": 0
+    }
+  }
+}

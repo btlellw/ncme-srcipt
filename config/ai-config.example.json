@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "endpoint": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+  "apiKey": "REPLACE_ME",
+  "model": "glm-4-flash",
+  "timeoutMs": 30000,
+  "temperature": 0,
+  "maxTokens": 32,
+  "maxQuestionsPerRequest": 10
+}

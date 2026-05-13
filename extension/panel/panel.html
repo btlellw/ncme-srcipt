@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NCME Auto Play Helper</title>
+    <link rel="stylesheet" href="panel.css">
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <h1>NCME Auto Play Helper</h1>
+        <p>课程自动播放、考试自动处理、AI 答题配置</p>
+      </div>
+      <span id="runtimeBadge" class="badge">未连接</span>
+    </header>
+
+    <main>
+      <section class="card">
+        <div class="row">
+          <button id="refreshBtn" class="primary">刷新状态</button>
+          <button id="resumeBtn">恢复自动化</button>
+          <button id="pauseBtn">暂停自动化</button>
+        </div>
+        <dl class="status-grid">
+          <div><dt>页面</dt><dd id="pageUrl">-</dd></div>
+          <div><dt>运行时</dt><dd id="runtimeStatus">-</dd></div>
+          <div><dt>停止原因</dt><dd id="stopReason">-</dd></div>
+          <div><dt>试卷识别</dt><dd id="paperStatus">-</dd></div>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2>AI 答题</h2>
+        <label class="check">
+          <input id="aiEnabled" type="checkbox">
+          启用 AI 作为题库缺失时的兜底答案源
+        </label>
+        <label>Endpoint
+          <input id="aiEndpoint" type="url" placeholder="https://open.bigmodel.cn/api/paas/v4/chat/completions">
+        </label>
+        <label>API Key
+          <input id="aiApiKey" type="password" placeholder="REPLACE_ME">
+        </label>
+        <label>Model
+          <input id="aiModel" type="text" placeholder="glm-4-flash">
+        </label>
+        <div class="grid-2">
+          <label>Timeout(ms)
+            <input id="aiTimeout" type="number" min="1000" step="1000">
+          </label>
+          <label>Max Questions
+            <input id="aiMaxQuestions" type="number" min="1" max="50">
+          </label>
+        </div>
+        <div class="row">
+          <button id="saveAiBtn" class="primary">保存 AI 配置</button>
+          <button id="toggleKeyBtn">显示/隐藏 Key</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>手动动作</h2>
+        <div class="row wrap">
+          <button data-debug="mainLoop">执行主循环</button>
+          <button data-debug="tryStartCourseFromList">尝试开始课程</button>
+          <button data-debug="autoHandleExam">处理考试页</button>
+          <button data-debug="answerExamByBankOrAi">题库/AI 作答</button>
+          <button data-debug="autoSubmitExam">直接提交考试</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="row between">
+          <h2>日志</h2>
+          <button id="clearLogBtn">清空</button>
+        </div>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script src="panel.js"></script>
+  </body>
+</html>

@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "NCME Auto Play Helper",
+  "version": "0.4.0",
+  "description": "NCME 课程自动播放、考试处理与 AI 答题浏览器扩展。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_icon": {
+      "128": "icons/icon128.png"
+    },
+    "default_title": "NCME Auto Play Helper"
+  },
+  "icons": {
+    "128": "icons/icon128.png"
+  },
+  "side_panel": {
+    "default_path": "panel/panel.html"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.ncme.org.cn/*"
+      ],
+      "js": [
+        "src/content/extension-bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://www.ncme.org.cn/*"
+      ],
+      "js": [
+        "src/content/page-bridge.js",
+        "src/legacy/ncme_autoplay.user.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
