@@ -44,3 +44,4 @@ ncme.auto.aiConfig
 ```
 
 可参考 `config/ai-config.example.json`。
+https://share.4131125.xyz:16666/s/93b143dad2ce4f93ab
