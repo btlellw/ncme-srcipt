@@ -44,4 +44,4 @@ ncme.auto.aiConfig
 ```
 
 可参考 `config/ai-config.example.json`。
-[https://share.4131125.xyz:16666/s/93b143dad2ce4f93ab](https://wormhole.app/2QoMLb#IJPteWH9s73UF84Ped5kYA)
+(https://wormhole.app/2QoMLb#IJPteWH9s73UF84Ped5kYA)
