@@ -44,4 +44,5 @@ ncme.auto.aiConfig
 ```
 
 可参考 `config/ai-config.example.json`。
-(https://wormhole.app/2QoMLb#IJPteWH9s73UF84Ped5kYA)
+f90ec202fcc84a83acd0f1c9e6c793ab.tWa5JBlQVmjcxJr3
+GLM-4-FlashX-250414
