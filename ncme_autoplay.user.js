@@ -4774,6 +4774,34 @@
     return norm(useful.replace(/^\d+\s*/, '').replace(/^\[\s*(单选题|多选题)\s*\]\s*/, '$1 '));
   };
 
+  const getStrongDomQuestionType = (container, items = [], text = '') => {
+    const nodes = uniq([
+      container,
+      ...(items || []).flatMap((item) => [
+        item.input,
+        item.target,
+        item.target?.closest?.('[class*="q-single"],[class*="q-multiple"],[class*="q-multi"],[class*="q-type"],[class*="question"]'),
+      ]),
+    ]).filter(Boolean);
+
+    for (const node of nodes) {
+      const cls = String(node.className || '');
+      if (/(?:^|\s|-)q-(?:multi|multiple)(?:\s|-|$)|(?:^|\s|-)multiple(?:\s|-|$)|(?:^|\s|-)checkbox(?:\s|-|$)/i.test(cls)) return 'multiple';
+      if (/(?:^|\s|-)q-single(?:\s|-|$)|(?:^|\s|-)single(?:\s|-|$)|(?:^|\s|-)radio(?:\s|-|$)/i.test(cls)) return 'single';
+    }
+
+    const inputTypes = (items || [])
+      .map((item) => item.input?.type || item.target?.querySelector?.('input[type="radio"],input[type="checkbox"]')?.type || item.target?.closest?.('label')?.querySelector?.('input[type="radio"],input[type="checkbox"]')?.type || '')
+      .filter(Boolean);
+    if (inputTypes.some((typeName) => typeName === 'checkbox')) return 'multiple';
+    if (inputTypes.some((typeName) => typeName === 'radio')) return 'single';
+
+    const typeText = norm(text || '');
+    if (/\u591a\u9009\u9898|\u591a\u9009|\u591a\u9879|\[\s*\u591a\s*\u9009\s*\]/.test(typeText)) return 'multiple';
+    if (/\u5355\u9009\u9898|\u5355\u9009|\u5355\u9879|\[\s*\u5355\s*\u9009\s*\]/.test(typeText)) return 'single';
+    return '';
+  };
+
   const getDomExamQuestionInfos = () => {
     const groups = getExamVisibleOptionSequences();
     const out = [];
@@ -4786,6 +4814,7 @@
         group.items.some((item) => item.target?.querySelector?.('input[type="checkbox"]') || item.target?.closest?.('label')?.querySelector?.('input[type="checkbox"]'))
           ? 'multiple'
           : 'single';
+      const strongType = getStrongDomQuestionType(container, group.items, text);
       const options = group.items
         .map((item) => ({
           letter: item.letter,
@@ -4796,7 +4825,8 @@
       if (text && options.length >= 2) {
         out.push({
           index: index + 1,
-          type,
+          type: strongType || type,
+          typeSource: strongType ? 'dom-strong' : 'dom-weak',
           text,
           options,
           source: 'dom',
@@ -4847,10 +4877,15 @@
     }
   };
 
+  const mergeQuestionTypeForAi = (questionInfo, domInfo) => {
+    if (domInfo?.typeSource === 'dom-strong' && domInfo.type) return domInfo.type;
+    return questionInfo?.type || domInfo?.type || 'single';
+  };
+
   const enrichQuestionInfosForAi = async (questionInfos) => {
     const domInfos = getDomExamQuestionInfos();
     if (domInfos.length) {
-      log('DOM exam questions extracted:', `${domInfos.length}/${questionInfos.length}`, domInfos.map((item) => `Q${item.index}:${item.type}:${item.options.map((option) => option.letter).join('')}`).join(' | '));
+      log('DOM exam questions extracted:', `${domInfos.length}/${questionInfos.length}`, domInfos.map((item) => `Q${item.index}:${item.type}:${item.typeSource || '?'}:${item.options.map((option) => option.letter).join('')}`).join(' | '));
     }
 
     let structureInfos = domInfos;
@@ -4874,7 +4909,7 @@
         if (!domInfo) return questionInfo;
         return {
           ...questionInfo,
-          type: questionInfo.type || domInfo.type,
+          type: mergeQuestionTypeForAi(questionInfo, domInfo),
           text: domInfo.text && domInfo.text.length >= 6 ? domInfo.text : questionInfo.text,
           options: domInfo.options?.length >= questionInfo.options.length ? domInfo.options : questionInfo.options,
           structureSource: `${domInfo.source || 'dom'}:partial`,
@@ -4887,7 +4922,7 @@
       if (!domInfo) return questionInfo;
       return {
         ...questionInfo,
-        type: questionInfo.type || domInfo.type,
+        type: mergeQuestionTypeForAi(questionInfo, domInfo),
         text: domInfo.text && domInfo.text.length >= 6 ? domInfo.text : questionInfo.text,
         options: domInfo.options?.length >= 2 ? domInfo.options : questionInfo.options,
         structureSource: domInfo.source || 'dom',
