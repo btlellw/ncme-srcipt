@@ -153,7 +153,9 @@ function addLog(message) {
 }
 
 function formatResult(value) {
-  if (value === undefined) return "undefined";
+  if (value === undefined) return "triggered; no return value";
+  if (value === false) return "false; action did not run or page state is not ready";
+  if (value === true) return "true";
   if (typeof value === "string") return value.slice(0, 300);
   try {
     return JSON.stringify(value).slice(0, 500);

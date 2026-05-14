@@ -379,6 +379,21 @@
     return norm(String(value || '').replace(/<[^>]+>/g, ' '));
   };
 
+  const getQuestionType = (question) => {
+    const raw = norm([
+      question?.questionType,
+      question?.type,
+      question?.subjectType,
+      question?.questionTypeName,
+      question?.typeName,
+      question?.title,
+      question?.questionTitle,
+    ].join(' '));
+    if (/multiple|multi|checkbox|多选|多项/.test(raw)) return 'multiple';
+    if (/single|radio|单选|单项/.test(raw)) return 'single';
+    return /多选|多项/.test(getQuestionText(question)) ? 'multiple' : 'single';
+  };
+
   const extractOptionList = (question) => {
     const sources = [
       question?.optionalContent,
@@ -462,6 +477,7 @@
       index: index + 1,
       code,
       text,
+      type: getQuestionType(question),
       options,
       key: `hash:${hashText(`${text}|${optionSignature}`)}`,
       codeKey: code ? `code:${code}` : '',
@@ -488,6 +504,7 @@
     return {
       answer,
       source: hit.source || 'bank',
+      verified: !!hit.verified,
       updatedAt: hit.updatedAt || 0,
     };
   };
@@ -506,7 +523,7 @@
       const payload = {
         answer,
         source,
-        verified: true,
+        verified: /^verified/i.test(String(source || '')),
         question: questionInfo.text || '',
         options: questionInfo.options || [],
         code: questionInfo.code || '',
@@ -1408,6 +1425,7 @@
 
   const buildAiQuestionPromptBlock = (item) => [
     `题号: ${item.index}`,
+    `题型: ${item.type === 'multiple' ? '多选题' : '单选题'}`,
     `题目: ${item.text}`,
     `可选字母: ${item.options.map((option) => option.letter).join(', ')}`,
     ...item.options.map((option) => `${option.letter}. ${option.text}`),
@@ -1450,7 +1468,8 @@
       {
         role: 'system',
         content:
-          '你是专业的搜题答题助手。用户会给你一道选择题和选项，你必须只从给定选项字母中选择最可能正确的一项。' +
+          '你是专业的搜题答题助手。用户会给你一道选择题和选项，你必须只从给定选项字母中选择答案。' +
+          '单选题返回一个字母；多选题返回所有正确字母。' +
           '严格返回 JSON，不要解释，不要 Markdown。',
       },
       {
@@ -1458,7 +1477,9 @@
         content: [
           '请回答下面这道题。',
           buildAiQuestionPromptBlock(questionInfo),
-          '返回格式必须是：{"answer":"A"}',
+          questionInfo.type === 'multiple'
+            ? '返回格式必须是：{"answer":["A","B"]}'
+            : '返回格式必须是：{"answer":"A"}',
           `answer 只能是这些字母之一：${questionInfo.options.map((option) => option.letter).join(', ')}`,
         ].join('\n\n'),
       },
@@ -1501,14 +1522,14 @@
           role: 'system',
           content:
             '你是专业的搜题答题助手。用户会给你一组选择题和选项。' +
-            '请逐题判断答案，必须只从每题给定的可选字母中选择。' +
+            '请逐题判断答案，必须只从每题给定的可选字母中选择。单选题返回一个字母；多选题返回所有正确字母。' +
             '严格返回 JSON，不要解释，不要 Markdown。',
         },
         {
           role: 'user',
           content: [
             `共有 ${chunk.length} 道题。返回 answers 数组，必须覆盖每一道题。`,
-            'JSON 格式示例：{"answers":[{"index":1,"answer":"A"},{"index":2,"answer":"B"}]}',
+            'JSON 格式示例：{"answers":[{"index":1,"answer":"A"},{"index":2,"answer":["A","C"]}]}',
             ...chunk.map(buildAiQuestionPromptBlock),
           ].join('\n\n'),
         },
@@ -3733,7 +3754,7 @@
       const markedCorrect =
         /correct|right|true|\u6b63\u786e|\u7b54\u5bf9/.test(statusText) &&
         !/wrong|false|\u9519\u8bef|\u7b54\u9519|\u672a\u7b54/.test(statusText);
-      const answer = correctAnswer || (markedCorrect ? userAnswer : '');
+      const answer = correctAnswer;
       if (!answer) return;
       if (correctAnswer && userAnswer && correctAnswer !== userAnswer && !markedCorrect) {
         records.push({
@@ -3744,7 +3765,7 @@
         });
         return;
       }
-      if (correctAnswer || markedCorrect) {
+      if (correctAnswer) {
         records.push({
           questionInfo: buildQuestionInfo(question, index),
           answer,
@@ -3774,7 +3795,7 @@
         `verified:${draft.source || 'draft'}`
       );
     } else {
-      saved += writeBankAnswers(getCorrectBankRecordsFromReport(), 'report');
+      saved += writeBankAnswers(getCorrectBankRecordsFromReport(), 'report:correctOnly');
     }
 
     if (saved > 0) {
@@ -4281,14 +4302,21 @@
     const answers = new Array(questionInfos.length).fill('');
     const sources = new Array(questionInfos.length).fill('');
     const unknown = [];
+    const ai = getAiConfig();
+    const aiProblem = getAiConfigProblem(ai);
 
     if (CFG.exam.autoAnswerByBank) {
       questionInfos.forEach((questionInfo, index) => {
         const hit = getBankAnswerForQuestion(questionInfo);
-        if (hit?.answer) {
+        const source = String(hit?.source || '');
+        const trusted = !!hit?.answer && (/^verified/i.test(source) || !CFG.exam.autoAnswerByAi || !!aiProblem);
+        if (trusted) {
           answers[index] = hit.answer;
           sources[index] = hit.source || 'bank';
         } else {
+          if (hit?.answer) {
+            log('ignore low-confidence bank answer and ask AI:', `Q${questionInfo.index}`, hit.source || 'bank');
+          }
           unknown.push(questionInfo);
         }
       });
@@ -4296,8 +4324,6 @@
       unknown.push(...questionInfos);
     }
 
-    const ai = getAiConfig();
-    const aiProblem = getAiConfigProblem(ai);
     let incompleteReason = '';
     const invalidAnswers = [];
 
@@ -4349,7 +4375,10 @@
       return false;
     }
 
-    const applied = applyExamAnswersToModel(answers, sources.includes('ai') ? 'ai' : 'bank');
+    const answerSource = sources.some((source) => /^ai/.test(source)) ? 'ai' : 'bank';
+    const modelApplied = applyExamAnswersToModel(answers, answerSource);
+    const domApplied = await answerExamByProvidedAnswers(answers, answerSource);
+    const applied = modelApplied || domApplied;
     if (applied) {
       examDynamicAnswerFailedKey = '';
       examDynamicAnswerFailedAt = 0;
@@ -4359,9 +4388,9 @@
           answer: answers[index],
           source: sources[index] || 'unknown',
         })),
-        sources.includes('ai') ? 'ai' : 'bank'
+        answerSource
       );
-      log('bank/AI answers applied:', answers.map((answer, index) => `Q${index + 1}:${answer}:${sources[index] || '?'}`).join(' | '));
+      log('bank/AI answers applied:', `model=${modelApplied}`, `dom=${domApplied}`, answers.map((answer, index) => `Q${index + 1}:${answer}:${sources[index] || '?'}`).join(' | '));
     }
     return applied;
   };
@@ -4567,6 +4596,28 @@
     return false;
   };
 
+  const chooseExamAnswerFromItems = (items, answer, questionLabel = 'Q?') => {
+    const letters = normalizeAnswerLetters(answer).split('');
+    if (!letters.length || !Array.isArray(items) || !items.length) return 0;
+
+    let applied = 0;
+    for (const letter of letters) {
+      const option = items.find((item) => item.letter === letter);
+      if (!option) {
+        log('exam target option missing:', questionLabel, letter, items.map((item) => item.letter).join(',') || 'none');
+        continue;
+      }
+      if (chooseExamOption(option)) {
+        applied += 1;
+        log('exam choose option ok:', questionLabel, letter);
+      } else {
+        log('exam choose option failed:', questionLabel, letter);
+      }
+      if (option.input?.type === 'radio') break;
+    }
+    return applied;
+  };
+
   const getExamVisibleOptionSequences = () => {
     const raw = getExamRawOptionCandidates()
       .filter((item) => /^[A-D]$/.test(item.letter))
@@ -4618,12 +4669,7 @@
     for (let i = 0; i < count; i += 1) {
       const answer = String(sheet.answers[i] || '').toUpperCase();
       const group = groups[i];
-      const option = group.items.find((item) => item.letter === answer);
-      if (!option) {
-        details.push(`Q${i + 1}:${answer}:missing:${group.letters.join('')}`);
-        continue;
-      }
-      if (chooseExamOption(option)) {
+      if (chooseExamAnswerFromItems(group.items, answer, `Q${i + 1}`) > 0) {
         applied += 1;
         details.push(`Q${i + 1}:${answer}:ok`);
       } else {
@@ -4652,12 +4698,7 @@
     for (let i = 0; i < Math.min(groups.length, sheet.answers.length); i += 1) {
       const answer = String(sheet.answers[i] || '').toUpperCase();
       const group = groups[i];
-      const option = group.inputs.find((item) => item.letter === answer);
-      if (!option) {
-        details.push(`Q${i + 1}:${answer}:missing`);
-        continue;
-      }
-      if (chooseExamOption(option)) {
+      if (chooseExamAnswerFromItems(group.inputs, answer, `Q${i + 1}`) > 0) {
         applied += 1;
         details.push(`Q${i + 1}:${answer}:ok`);
       } else {
@@ -4685,9 +4726,35 @@
     return false;
   };
 
-  const answerExamStepByStep = async () => {
-    const sheet = getExamAnswerSheet();
-    if (!sheet.paperNo || !sheet.answers.length) return false;
+  const answerExamGroupsByAnswers = (answerList, source = 'answers') => {
+    const groups = getExamQuestionGroups();
+    if (groups.length === 0) {
+      log('exam question groups not found yet');
+      return false;
+    }
+
+    let applied = 0;
+    const details = [];
+    for (let i = 0; i < Math.min(groups.length, answerList.length); i += 1) {
+      const answer = normalizeAnswerLetters(answerList[i] || '');
+      if (!answer) continue;
+      const group = groups[i];
+      const count = chooseExamAnswerFromItems(group.inputs, answer, `Q${i + 1}`);
+      if (count > 0) {
+        applied += 1;
+        details.push(`Q${i + 1}:${answer}:ok`);
+      } else {
+        details.push(`Q${i + 1}:${answer}:fail`);
+      }
+    }
+
+    log(`exam ${source} DOM groups applied:`, `${applied}/${Math.min(groups.length, answerList.length)}`, details.join(' | '));
+    return applied > 0;
+  };
+
+  const answerExamStepByAnswers = async (answerList, source = 'answers') => {
+    const answers = (answerList || []).map(normalizeAnswerLetters);
+    if (!answers.some(Boolean)) return false;
 
     const startButton = findExamStartButton();
     if (startButton) {
@@ -4698,13 +4765,13 @@
 
     let answeredCount = 0;
     let expectedIndex = getExamCurrentQuestionIndex() || 1;
-    const stepLimit = Math.max(sheet.answers.length * 2, 6);
+    const stepLimit = Math.max(answers.length * 2, 6);
 
     for (let step = 0; step < stepLimit; step += 1) {
       const currentIndex = getExamCurrentQuestionIndex() || expectedIndex;
-      const answer = sheet.answers[currentIndex - 1];
+      const answer = answers[currentIndex - 1];
       if (!answer) {
-        log('exam current question index out of range:', currentIndex, sheet.answers.length);
+        log('exam current question index out of range:', currentIndex, answers.length);
         break;
       }
 
@@ -4716,22 +4783,15 @@
         optionState.items.map((item) => `${item.letter}:${item.text.slice(0, 40)}`).join(' | ')
       );
 
-      const option = optionState.items.find((item) => item.letter === answer);
-      if (!option) {
-        log('exam target option missing:', `Q${currentIndex}`, answer, optionState.letters.join(',') || 'none');
-        return false;
-      }
-
-      if (!chooseExamOption(option)) {
-        log('exam choose option failed:', `Q${currentIndex}`, answer);
+      if (chooseExamAnswerFromItems(optionState.items, answer, `Q${currentIndex}`) === 0) {
         return false;
       }
 
       answeredCount += 1;
-      log('exam step answered:', `Q${currentIndex}`, answer);
+      log(`exam ${source} step answered:`, `Q${currentIndex}`, answer);
       await sleep(600);
 
-      if (currentIndex >= sheet.answers.length) {
+      if (currentIndex >= answers.length) {
         return answeredCount > 0;
       }
 
@@ -4748,6 +4808,24 @@
     }
 
     return answeredCount > 0;
+  };
+
+  const answerExamByProvidedAnswers = async (answerList, source = 'answers') => {
+    const answers = (answerList || []).map(normalizeAnswerLetters);
+    if (!answers.some(Boolean)) return false;
+    const visibleGroupCount = getExamQuestionGroups().length;
+    const answerCount = answers.filter(Boolean).length;
+    if (visibleGroupCount >= answerCount && answerExamGroupsByAnswers(answers, source)) {
+      await sleep(600);
+      return true;
+    }
+    return answerExamStepByAnswers(answers, source);
+  };
+
+  const answerExamStepByStep = async () => {
+    const sheet = getExamAnswerSheet();
+    if (!sheet.paperNo || !sheet.answers.length) return false;
+    return answerExamStepByAnswers(sheet.answers, 'sheet');
   };
 
   const findExamSubmitButtons = () => {
