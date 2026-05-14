@@ -4430,6 +4430,49 @@
   const findExamNextButton = () =>
     queryByText(/下一题|下一页|下一步|继续答题|继续考试/, 'button,a,span,div');
 
+  const findExamQuestionJumpButton = (index) => {
+    const expected = String(Number(index || 0));
+    if (!expected || expected === '0') return null;
+
+    const candidates = [];
+    const selector = 'button,a,li,span,div,[role="button"],[role="radio"],[role="checkbox"]';
+    for (const el of queryAllDeep(selector)) {
+      if (!isVisible(el) || isDisabled(el)) continue;
+      const compactText = norm(el.textContent || '').replace(/\s+/g, '');
+      if (!compactText || !new RegExp(`^(?:\\u7b2c)?${expected}(?:\\u9898)?$`).test(compactText)) continue;
+      const hasExactChild = Array.from(el.children || []).some((child) => {
+        const childText = norm(child.textContent || '').replace(/\s+/g, '');
+        return childText && childText === compactText && isVisible(child);
+      });
+      if (hasExactChild) continue;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 5 || rect.height < 5 || rect.width > 140 || rect.height > 100) continue;
+
+      const parentText = norm((el.closest('[class*="card"],[class*="sheet"],[class*="answer"],[class*="right"],[class*="side"],[class*="paper"]') || el.parentElement || el).textContent || '');
+      const style = el.ownerDocument?.defaultView?.getComputedStyle(el);
+      let score = 0;
+      if (rect.left > window.innerWidth * 0.45) score += 30;
+      if (/\u7b54\u9898\u5361|\u5df2\u7b54|\u672a\u7b54|\u5355\u9009\u9898|\u591a\u9009\u9898/.test(parentText)) score += 25;
+      if (el.matches('button,a,li,[role="button"],[role="radio"],[role="checkbox"]')) score += 12;
+      if (style?.cursor === 'pointer') score += 8;
+      candidates.push({ el, score, top: rect.top, left: rect.left });
+    }
+
+    candidates.sort((a, b) => b.score - a.score || b.left - a.left || a.top - b.top);
+    return candidates[0]?.el || null;
+  };
+
+  const jumpExamToQuestion = async (index) => {
+    const target = findExamQuestionJumpButton(index);
+    if (!target) return false;
+    const prevSignature = getExamQuestionSignature();
+    log('exam jump by question card:', `Q${index}`, norm(target.textContent || ''));
+    forceClickEl(target);
+    await waitForExamQuestionChange(prevSignature, getExamCurrentQuestionIndex(), 5000);
+    return true;
+  };
+
   const getExamInputVisibilityTarget = (input) =>
     input.closest('label') ||
     (input.id ? document.querySelector(`label[for="${escapeCss(input.id)}"]`) : null) ||
@@ -4582,8 +4625,28 @@
     return getExamTextOptionGroups();
   };
 
+  const isExamOptionSelected = (item) => {
+    if (!item) return false;
+    if (item.input) return !!item.input.checked;
+    const target = item.target;
+    const nodes = uniq([
+      target,
+      target?.closest?.('label'),
+      target?.closest?.('li'),
+      target?.closest?.('button'),
+      target?.closest?.('[role="radio"],[role="checkbox"]'),
+    ]).filter(Boolean);
+    return nodes.some((node) => (
+      node.getAttribute?.('aria-checked') === 'true' ||
+      node.classList?.contains('is-checked') ||
+      node.classList?.contains('checked') ||
+      node.classList?.contains('selected')
+    ));
+  };
+
   const chooseExamOption = (item) => {
     if (!item) return false;
+    if (isExamOptionSelected(item)) return true;
 
     const target = item.target;
     if (target && isVisible(target) && !isDisabled(target)) {
@@ -4792,7 +4855,7 @@
     let structureInfos = domInfos;
     if (structureInfos.length < questionInfos.length) {
       if (structureInfos.length > 0) {
-        log('skip partial DOM question structure for AI mapping:', `${structureInfos.length}/${questionInfos.length}`);
+        log('partial DOM question structure available:', `${structureInfos.length}/${questionInfos.length}`);
       }
       const aiInfos = await askAiAnalyzeExamPageStructure();
       if (aiInfos.length >= questionInfos.length && aiInfos.length > structureInfos.length) {
@@ -4831,20 +4894,16 @@
     });
   };
 
-  const answerExamByVisibleOptionSequences = () => {
-    if (!CFG.exam.autoSelectBySheet) return false;
-
-    const sheet = getExamAnswerSheet();
-    if (!sheet.paperNo || !sheet.answers.length) return false;
-
+  const answerExamVisibleSequencesByAnswers = (answerList, source = 'answers') => {
     const groups = getExamVisibleOptionSequences();
     if (groups.length === 0) return false;
 
     let applied = 0;
     const details = [];
-    const count = Math.min(sheet.answers.length, groups.length);
+    const count = Math.min(answerList.length, groups.length);
     for (let i = 0; i < count; i += 1) {
-      const answer = String(sheet.answers[i] || '').toUpperCase();
+      const answer = normalizeAnswerLetters(answerList[i] || '');
+      if (!answer) continue;
       const group = groups[i];
       if (chooseExamAnswerFromItems(group.items, answer, `Q${i + 1}`) > 0) {
         applied += 1;
@@ -4854,8 +4913,17 @@
       }
     }
 
-    log('exam visible option sequence applied:', `${applied}/${count}`, details.join(' | '));
+    log(`exam ${source} visible option sequence applied:`, `${applied}/${count}`, details.join(' | '));
     return applied > 0;
+  };
+
+  const answerExamByVisibleOptionSequences = () => {
+    if (!CFG.exam.autoSelectBySheet) return false;
+
+    const sheet = getExamAnswerSheet();
+    if (!sheet.paperNo || !sheet.answers.length) return false;
+
+    return answerExamVisibleSequencesByAnswers(sheet.answers, 'sheet');
   };
 
   const answerExamBySheet = () => {
@@ -4929,6 +4997,40 @@
     return applied > 0;
   };
 
+  const answerExamByQuestionCardAnswers = async (answerList, source = 'answers', startIndex = 1) => {
+    const answers = (answerList || []).map(normalizeAnswerLetters);
+    let applied = 0;
+    const details = [];
+    for (let i = Math.max(0, Number(startIndex || 1) - 1); i < answers.length; i += 1) {
+      const answer = answers[i];
+      if (!answer) continue;
+      const questionIndex = i + 1;
+      if (!(await jumpExamToQuestion(questionIndex))) {
+        details.push(`Q${questionIndex}:${answer}:no-card`);
+        continue;
+      }
+      await sleep(300);
+      const optionState = getExamCurrentQuestionOptions();
+      log(
+        'exam card option scope:',
+        `Q${questionIndex}`,
+        optionState.letters.join(',') || 'none',
+        optionState.items.map((item) => `${item.letter}:${item.text.slice(0, 40)}`).join(' | ')
+      );
+      if (chooseExamAnswerFromItems(optionState.items, answer, `Q${questionIndex}`) > 0) {
+        applied += 1;
+        details.push(`Q${questionIndex}:${answer}:ok`);
+      } else {
+        details.push(`Q${questionIndex}:${answer}:fail`);
+      }
+      await sleep(250);
+    }
+    if (details.length) {
+      log(`exam ${source} question card applied:`, `${applied}/${details.length}`, details.join(' | '));
+    }
+    return applied > 0;
+  };
+
   const answerExamStepByAnswers = async (answerList, source = 'answers') => {
     const answers = (answerList || []).map(normalizeAnswerLetters);
     if (!answers.some(Boolean)) return false;
@@ -4974,6 +5076,10 @@
 
       const nextButton = findExamNextButton();
       if (!nextButton) {
+        if (await jumpExamToQuestion(currentIndex + 1)) {
+          expectedIndex = currentIndex + 1;
+          continue;
+        }
         log('exam next button not found after answer:', `Q${currentIndex}`);
         return answeredCount > 0;
       }
@@ -4995,6 +5101,18 @@
     if (visibleGroupCount >= answerCount && answerExamGroupsByAnswers(answers, source)) {
       await sleep(600);
       return true;
+    }
+    const visibleSequenceCount = getExamVisibleOptionSequences().length;
+    if (visibleSequenceCount > 1) {
+      const sequenceApplied = answerExamVisibleSequencesByAnswers(answers, source);
+      if (sequenceApplied) {
+        await sleep(600);
+        if (visibleSequenceCount < answerCount) {
+          await answerExamByQuestionCardAnswers(answers, source, visibleSequenceCount + 1);
+          await sleep(300);
+        }
+        return true;
+      }
     }
     return answerExamStepByAnswers(answers, source);
   };
