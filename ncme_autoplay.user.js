@@ -491,11 +491,12 @@
     const normalized = normalizeAnswerLetters(answer);
     if (!normalized) return '';
     const optionLetters = new Set((questionInfo?.options || []).map((item) => item.letter).filter(Boolean));
-    if (!optionLetters.size) return normalized;
-    return normalized
+    if (!optionLetters.size) return questionInfo?.type === 'multiple' ? normalized : normalized.charAt(0);
+    const filtered = normalized
       .split('')
       .filter((letter) => optionLetters.has(letter))
       .join('');
+    return questionInfo?.type === 'multiple' ? filtered : filtered.charAt(0);
   };
 
   const getBankAnswerForQuestion = (questionInfo) => {
@@ -4873,7 +4874,7 @@
         if (!domInfo) return questionInfo;
         return {
           ...questionInfo,
-          type: domInfo.type || questionInfo.type,
+          type: questionInfo.type || domInfo.type,
           text: domInfo.text && domInfo.text.length >= 6 ? domInfo.text : questionInfo.text,
           options: domInfo.options?.length >= questionInfo.options.length ? domInfo.options : questionInfo.options,
           structureSource: `${domInfo.source || 'dom'}:partial`,
@@ -4886,7 +4887,7 @@
       if (!domInfo) return questionInfo;
       return {
         ...questionInfo,
-        type: domInfo.type || questionInfo.type,
+        type: questionInfo.type || domInfo.type,
         text: domInfo.text && domInfo.text.length >= 6 ? domInfo.text : questionInfo.text,
         options: domInfo.options?.length >= 2 ? domInfo.options : questionInfo.options,
         structureSource: domInfo.source || 'dom',
