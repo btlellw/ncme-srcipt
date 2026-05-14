@@ -4298,7 +4298,7 @@
     const questions = model?.questions || [];
     if (!questions.length) return false;
 
-    const questionInfos = questions.map((question, index) => buildQuestionInfo(question, index));
+    const questionInfos = await enrichQuestionInfosForAi(questions.map((question, index) => buildQuestionInfo(question, index)));
     const answers = new Array(questionInfos.length).fill('');
     const sources = new Array(questionInfos.length).fill('');
     const unknown = [];
@@ -4620,7 +4620,7 @@
 
   const getExamVisibleOptionSequences = () => {
     const raw = getExamRawOptionCandidates()
-      .filter((item) => /^[A-D]$/.test(item.letter))
+      .filter((item) => /^[A-F]$/.test(item.letter))
       .sort((a, b) => a.top - b.top || a.left - b.left);
 
     const groups = [];
@@ -4652,6 +4652,150 @@
       items,
       top: Math.min(...items.map((item) => item.top)),
     }));
+  };
+
+  const getCommonAncestor = (nodes) => {
+    const valid = (nodes || []).filter(Boolean);
+    if (!valid.length) return null;
+    let current = valid[0];
+    while (current && current.nodeType === Node.ELEMENT_NODE) {
+      if (valid.every((node) => current === node || current.contains(node))) return current;
+      current = current.parentElement;
+    }
+    return valid[0].parentElement || valid[0];
+  };
+
+  const getDomQuestionContainer = (items) => {
+    const targets = (items || []).map((item) => item.target).filter(Boolean);
+    let current = getCommonAncestor(targets);
+    let best = current;
+    let depth = 0;
+    while (current && current !== document.body && depth < 8) {
+      const text = norm(current.innerText || current.textContent || '');
+      const markerCount = (text.match(/单选题|多选题|第\s*\d+\s*题|\[\s*(?:单|多)选题\s*\]/g) || []).length;
+      const hasAllLetters = (items || []).every((item) => text.includes(item.letter));
+      if (text.length < 4000 && hasAllLetters) {
+        best = current;
+      }
+      if (markerCount > 1 && best !== current) break;
+      current = current.parentElement;
+      depth += 1;
+    }
+    return best;
+  };
+
+  const extractDomQuestionText = (container, optionItems) => {
+    const optionTexts = new Set((optionItems || []).map((item) => normalizeOptionText(item.text)).filter(Boolean));
+    const lines = String(container?.innerText || container?.textContent || '')
+      .split(/\n+/)
+      .map((line) => norm(line))
+      .filter(Boolean)
+      .filter((line) => !/^(?:[A-F]|[A-F][\s).:：、．-].*)$/i.test(line))
+      .filter((line) => !optionTexts.has(normalizeOptionText(line)))
+      .filter((line) => !/^(?:返回|计算器|答题卡|已答|未答|提交|结束练习|上一题|下一题)$/.test(compact(line)));
+    const useful = lines.find((line) => /单选题|多选题|\?|？|以下|下列|哪些|哪项|是否|属于|不属于|正确|错误/.test(line)) || lines[0] || '';
+    return norm(useful.replace(/^\d+\s*/, '').replace(/^\[\s*(单选题|多选题)\s*\]\s*/, '$1 '));
+  };
+
+  const getDomExamQuestionInfos = () => {
+    const groups = getExamVisibleOptionSequences();
+    const out = [];
+    groups.forEach((group, index) => {
+      const container = getDomQuestionContainer(group.items);
+      const text = extractDomQuestionText(container, group.items);
+      const typeText = norm([text, container?.innerText || ''].join(' '));
+      const type =
+        /多选题|多选|多项|checkbox/.test(typeText) ||
+        group.items.some((item) => item.target?.querySelector?.('input[type="checkbox"]') || item.target?.closest?.('label')?.querySelector?.('input[type="checkbox"]'))
+          ? 'multiple'
+          : 'single';
+      const options = group.items
+        .map((item) => ({
+          letter: item.letter,
+          text: normalizeOptionText(item.text || item.target?.textContent || item.letter) || item.letter,
+        }))
+        .filter((item, itemIndex, arr) => item.letter && arr.findIndex((candidate) => candidate.letter === item.letter) === itemIndex)
+        .sort((a, b) => a.letter.localeCompare(b.letter));
+      if (text && options.length >= 2) {
+        out.push({
+          index: index + 1,
+          type,
+          text,
+          options,
+          source: 'dom',
+        });
+      }
+    });
+    return out;
+  };
+
+  const askAiAnalyzeExamPageStructure = async () => {
+    const bodyText = getBodyLines().slice(0, 240).join('\n').slice(0, 20000);
+    if (!bodyText) return [];
+    const messages = [
+      {
+        role: 'system',
+        content:
+          '你是网页答题结构分析助手。只提取页面中的题目结构，不要作答。' +
+          '严格返回 JSON，不要解释，不要 Markdown。',
+      },
+      {
+        role: 'user',
+        content: [
+          '从下面页面文本中提取所有单选题/多选题的题干和选项。',
+          '返回格式：{"questions":[{"index":1,"type":"single|multiple","text":"题干","options":[{"letter":"A","text":"选项"}]}]}',
+          bodyText,
+        ].join('\n\n'),
+      },
+    ];
+    try {
+      const result = await postAiChatCompletion(messages);
+      const content = result?.choices?.[0]?.message?.content || result?.choices?.[0]?.text || '';
+      const jsonText = String(content || '').replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-z]*|```/gi, '')).match(/\{[\s\S]*\}/)?.[0] || content;
+      const parsed = safeJsonParse(jsonText, null);
+      const questions = Array.isArray(parsed?.questions) ? parsed.questions : [];
+      return questions.map((item, index) => ({
+        index: Number(item.index || index + 1),
+        type: /multiple|多/.test(String(item.type || '')) ? 'multiple' : 'single',
+        text: norm(item.text || item.question || item.title || ''),
+        options: (Array.isArray(item.options) ? item.options : []).map((option, optionIndex) => ({
+          letter: String(option.letter || option.label || String.fromCharCode(65 + optionIndex)).toUpperCase().replace(/[^A-F]/g, '').slice(0, 1),
+          text: normalizeOptionText(option.text || option.content || option.name || ''),
+        })).filter((option) => option.letter && option.text),
+        source: 'ai-structure',
+      })).filter((item) => item.text && item.options.length >= 2);
+    } catch (err) {
+      log('AI page structure analysis failed:', err);
+      return [];
+    }
+  };
+
+  const enrichQuestionInfosForAi = async (questionInfos) => {
+    const domInfos = getDomExamQuestionInfos();
+    if (domInfos.length) {
+      log('DOM exam questions extracted:', `${domInfos.length}/${questionInfos.length}`, domInfos.map((item) => `Q${item.index}:${item.type}:${item.options.map((option) => option.letter).join('')}`).join(' | '));
+    }
+
+    let structureInfos = domInfos;
+    if (structureInfos.length < questionInfos.length) {
+      const aiInfos = await askAiAnalyzeExamPageStructure();
+      if (aiInfos.length > structureInfos.length) {
+        log('AI page structure extracted:', `${aiInfos.length}/${questionInfos.length}`);
+        structureInfos = aiInfos;
+      }
+    }
+
+    return questionInfos.map((questionInfo, index) => {
+      const domInfo = structureInfos.find((item) => item.index === questionInfo.index) || structureInfos[index] || null;
+      if (!domInfo) return questionInfo;
+      return {
+        ...questionInfo,
+        type: domInfo.type || questionInfo.type,
+        text: domInfo.text && domInfo.text.length >= 6 ? domInfo.text : questionInfo.text,
+        options: domInfo.options?.length >= 2 ? domInfo.options : questionInfo.options,
+        structureSource: domInfo.source || 'dom',
+      };
+    });
   };
 
   const answerExamByVisibleOptionSequences = () => {
@@ -5249,6 +5393,23 @@
           notifyTitle: '从课程列表进入视频',
           keyPrefix: 'list-click',
           failureReason: 'list-click-failed',
+        }),
+      };
+    }
+
+    if (examEntry) {
+      log('force pending exam because no playable video remains:', examEntry.title || examEntry.rowText.slice(0, 120), examEntry.status || '(unknown)');
+      return {
+        type: 'exam',
+        entry: examEntry,
+        execute: () => clickListEntryAction(examEntry, {
+          kind: 'exam',
+          snapshot,
+          progressText,
+          notifyTitle: '从课程目录进入试卷',
+          keyPrefix: 'list-exam-force-click',
+          expectedExamSource: 'list-exam-force-click',
+          failureReason: 'exam-force-click-failed',
         }),
       };
     }
