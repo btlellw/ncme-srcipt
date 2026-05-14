@@ -380,6 +380,9 @@
   };
 
   const getQuestionType = (question) => {
+    const numericType = Number(question?.questionType ?? question?.type ?? question?.subjectType);
+    if (numericType === 2 || numericType === 3) return 'multiple';
+    if (numericType === 1) return 'single';
     const raw = norm([
       question?.questionType,
       question?.type,
@@ -1322,7 +1325,7 @@
       .catch(reject);
   });
 
-  const postAiChatCompletion = (messages) => new Promise((resolve, reject) => {
+  const postAiChatCompletion = (messages, options = {}) => new Promise((resolve, reject) => {
     const ai = getAiConfig();
     const problem = getAiConfigProblem(ai);
     if (problem) {
@@ -1342,8 +1345,9 @@
       messages,
       temperature: ai.temperature ?? 0,
     };
-    if (ai.maxTokens) {
-      requestPayload.max_tokens = ai.maxTokens;
+    const maxTokens = options.maxTokens ?? ai.maxTokens;
+    if (maxTokens) {
+      requestPayload.max_tokens = maxTokens;
     }
     const body = JSON.stringify(requestPayload);
 
@@ -1485,7 +1489,7 @@
       },
     ];
 
-    const result = await postAiChatCompletion(messages);
+    const result = await postAiChatCompletion(messages, { maxTokens: 128 });
     const content = result?.choices?.[0]?.message?.content || result?.choices?.[0]?.text || '';
     const answer = parseAiSingleAnswer(content, questionInfo);
     log('AI single exam answer:', `Q${questionInfo.index}:${answer || '(empty)'}`, String(content || '').slice(0, 120));
@@ -1535,9 +1539,12 @@
         },
       ];
 
-      const result = await postAiChatCompletion(messages);
+      const result = await postAiChatCompletion(messages, { maxTokens: Math.max(256, chunk.length * 48) });
       const content = result?.choices?.[0]?.message?.content || result?.choices?.[0]?.text || '';
       const answers = parseAiAnswers(content);
+      if (!Object.keys(answers).length) {
+        log('AI exam answer batch raw empty/invalid:', String(content || '').slice(0, 500));
+      }
       chunk.forEach((item, position) => {
         const rawAnswer = answers[item.index] || answers[position + 1] || '';
         const answer = filterAnswerByQuestionOptions(rawAnswer, item);
@@ -4749,7 +4756,7 @@
       },
     ];
     try {
-      const result = await postAiChatCompletion(messages);
+      const result = await postAiChatCompletion(messages, { maxTokens: 1200 });
       const content = result?.choices?.[0]?.message?.content || result?.choices?.[0]?.text || '';
       const jsonText = String(content || '').replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-z]*|```/gi, '')).match(/\{[\s\S]*\}/)?.[0] || content;
       const parsed = safeJsonParse(jsonText, null);
@@ -4778,11 +4785,19 @@
 
     let structureInfos = domInfos;
     if (structureInfos.length < questionInfos.length) {
+      if (structureInfos.length > 0) {
+        log('skip partial DOM question structure for AI mapping:', `${structureInfos.length}/${questionInfos.length}`);
+      }
       const aiInfos = await askAiAnalyzeExamPageStructure();
-      if (aiInfos.length > structureInfos.length) {
+      if (aiInfos.length >= questionInfos.length && aiInfos.length > structureInfos.length) {
         log('AI page structure extracted:', `${aiInfos.length}/${questionInfos.length}`);
         structureInfos = aiInfos;
       }
+    }
+
+    if (structureInfos.length < questionInfos.length) {
+      log('use Vue question model for AI mapping:', `${structureInfos.length}/${questionInfos.length}`);
+      return questionInfos;
     }
 
     return questionInfos.map((questionInfo, index) => {
