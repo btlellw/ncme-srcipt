@@ -42,6 +42,8 @@ els.clearLogBtn.addEventListener("click", () => {
   els.log.textContent = "";
 });
 
+addMaintenanceButtons();
+
 document.querySelectorAll("[data-debug]").forEach((button) => {
   button.addEventListener("click", async () => {
     const method = button.dataset.debug;
@@ -54,6 +56,42 @@ document.querySelectorAll("[data-debug]").forEach((button) => {
     }
   });
 });
+
+function addMaintenanceButtons() {
+  const actionRow = document.querySelector("[data-debug='autoSubmitExam']")?.parentElement;
+  if (!actionRow || document.getElementById("clearAnswerBankBtn")) return;
+
+  const clearBankBtn = document.createElement("button");
+  clearBankBtn.id = "clearAnswerBankBtn";
+  clearBankBtn.className = "danger";
+  clearBankBtn.textContent = "\u6e05\u7a7a\u9898\u5e93";
+  clearBankBtn.addEventListener("click", async () => {
+    if (!confirm("\u786e\u5b9a\u6e05\u7a7a\u5f53\u524d NCME \u9875\u9762\u7684\u672c\u5730\u9898\u5e93\uff1f")) return;
+    try {
+      await runCommand("clearAnswerBank");
+      addLog("\u9898\u5e93\u5df2\u6e05\u7a7a");
+      await refreshStatus();
+    } catch (error) {
+      addLog(`\u6e05\u7a7a\u9898\u5e93\u5931\u8d25: ${error.message}`);
+    }
+  });
+
+  const clearDraftBtn = document.createElement("button");
+  clearDraftBtn.id = "clearAnswerDraftBtn";
+  clearDraftBtn.textContent = "\u6e05\u7a7a\u7b54\u9898\u8349\u7a3f";
+  clearDraftBtn.addEventListener("click", async () => {
+    try {
+      await runCommand("clearAnswerDraft");
+      addLog("\u7b54\u9898\u8349\u7a3f\u5df2\u6e05\u7a7a");
+      await refreshStatus();
+    } catch (error) {
+      addLog(`\u6e05\u7a7a\u7b54\u9898\u8349\u7a3f\u5931\u8d25: ${error.message}`);
+    }
+  });
+
+  actionRow.appendChild(clearBankBtn);
+  actionRow.appendChild(clearDraftBtn);
+}
 
 async function refreshStatus() {
   try {
