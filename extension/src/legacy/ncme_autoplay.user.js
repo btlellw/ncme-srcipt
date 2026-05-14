@@ -1474,6 +1474,7 @@
         content:
           '你是专业的搜题答题助手。用户会给你一道选择题和选项，你必须只从给定选项字母中选择答案。' +
           '单选题返回一个字母；多选题返回所有正确字母。' +
+          '不要默认选择 A；多选题不要无依据地全选，逐个判断每个选项是否正确。' +
           '严格返回 JSON，不要解释，不要 Markdown。',
       },
       {
@@ -1516,6 +1517,11 @@
     if (!pending.length) return {};
 
     const ai = getAiConfig();
+    if (ai.perQuestion !== false) {
+      log('AI exam answers use per-question mode:', pending.length);
+      return askAiForExamAnswersOneByOne(pending);
+    }
+
     const mapped = {};
     const chunkSize = Math.max(1, Number(ai.maxQuestionsPerRequest || CFG.ai.maxQuestionsPerRequest || 10) || 10);
 
@@ -4797,7 +4803,19 @@
 
     if (structureInfos.length < questionInfos.length) {
       log('use Vue question model for AI mapping:', `${structureInfos.length}/${questionInfos.length}`);
-      return questionInfos;
+      if (!structureInfos.length) return questionInfos;
+      log('merge partial DOM question text/type only:', `${structureInfos.length}/${questionInfos.length}`);
+      return questionInfos.map((questionInfo, index) => {
+        const domInfo = structureInfos.find((item) => item.index === questionInfo.index) || structureInfos[index] || null;
+        if (!domInfo) return questionInfo;
+        return {
+          ...questionInfo,
+          type: domInfo.type || questionInfo.type,
+          text: domInfo.text && domInfo.text.length >= 6 ? domInfo.text : questionInfo.text,
+          options: domInfo.options?.length >= questionInfo.options.length ? domInfo.options : questionInfo.options,
+          structureSource: `${domInfo.source || 'dom'}:partial`,
+        };
+      });
     }
 
     return questionInfos.map((questionInfo, index) => {
