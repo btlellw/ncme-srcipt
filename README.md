@@ -46,3 +46,4 @@ ncme.auto.aiConfig
 可参考 `config/ai-config.example.json`。
 f90ec202fcc84a83acd0f1c9e6c793ab.tWa5JBlQVmjcxJr3
 GLM-4-FlashX-250414
+https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=941705ed-35d5-4327-ad00-ffc4d9e756fe
